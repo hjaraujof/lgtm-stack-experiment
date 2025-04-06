@@ -1,0 +1,88 @@
+# Basic Mimir configuration for local Docker Compose (monolithic mode) - Simplified
+
+target: all # Run all components in a single process (monolithic mode)
+
+# Authentication is disabled by default (no auth block)
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+  # log_level: debug # Uncomment for verbose logging
+
+# Use filesystem storage for simplicity
+common:
+  storage:
+    backend: filesystem
+    filesystem:
+      dir: /data/tsdb # Time series database storage
+
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/blocks # Block storage (TSDB blocks, rule groups, etc.)
+  tsdb:
+    dir: /data/tsdb # Explicitly define TSDB storage path
+    retention_period: 48h # Keep blocks for 48 hours locally (adjust as needed)
+
+# --- Component Configurations (minimal for monolithic mode) ---
+
+distributor:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+ingester:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+# --- Limits Configuration --- (Relying on defaults)
+limits:
+  # Keep limits reasonable for local development
+  ingestion_rate: 10000 # Samples per second
+  ingestion_burst_size: 20000
+  max_label_names_per_series: 20
+  max_label_value_length: 512
+  max_label_name_length: 256
+  # Removed query limits and multi-tenancy setting
+
+# --- Alertmanager ---
+alertmanager:
+  # Alertmanager runs within Mimir in monolithic mode
+  data_dir: /data/alertmanager
+  external_url: http://localhost:9009/alertmanager # URL to access Alertmanager UI via Mimir
+
+# --- Ruler ---
+ruler:
+  # Ruler also runs within Mimir
+  rule_path: /data/rules # Path for rule files within the container
+  alertmanager_url: http://localhost:9009/alertmanager # Internal URL to Alertmanager
+  ring:
+    kvstore:
+      store: inmemory
+  # Ruler uses blocks_storage by default in monolithic mode
+  # Explicit storage block removed as it caused errors
+
+# --- Query Frontend --- (Removed for simplicity)
+
+# --- Store Gateway ---
+store_gateway:
+  # Relevant for querying older blocks
+  # Removed sharding_enabled and ring
+
+# --- Compactor ---
+compactor:
+  # Manages TSDB block compaction
+  data_dir: /data/compactor
+  # Removed sharding_enabled
+  compaction_interval: 5m # Run compaction frequently
+  # retention_period: 0s # Inherits from blocks_storage.tsdb by default
+
+# --- Ruler Storage ---
+# Explicitly define ruler storage to avoid path conflicts with TSDB
+ruler_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/ruler-storage

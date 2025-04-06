@@ -1,0 +1,59 @@
+# Basic Tempo configuration for local Docker Compose setup
+
+server:
+  http_listen_port: 3200
+  # log_level: debug # Uncomment for verbose logging
+
+distributor:
+  receivers: # Enable OTLP receivers
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317 # Explicitly set gRPC endpoint
+        http:
+          endpoint: 0.0.0.0:4318 # Explicitly set HTTP endpoint
+    # jaeger: # Optional: Uncomment to enable Jaeger receivers
+    #   protocols:
+    #     thrift_http: # Port 14268
+    # zipkin: # Optional: Uncomment to enable Zipkin receiver
+    #   protocols:
+    #     http: # Port 9411
+
+ingester:
+  trace_idle_period: 10s               # Time before flushing an idle trace
+  # max_block_bytes: 1_000_000         # 1MB per block
+  # max_block_duration: 5m             # Cut blocks every 5 mins
+
+compactor:
+  compaction:
+    compaction_window: 1h              # Compact traces older than 1 hour
+    block_retention: 1h                # Retain compacted blocks for 1 hour locally (adjust as needed)
+    # compact_block_timeout: 5m
+
+storage:
+  trace:
+    backend: local                     # Use filesystem backend for local storage
+    local:
+      path: /tmp/tempo/blocks          # Path inside the container for trace blocks
+    # Optional: Configure connection to Loki for trace-to-logs/service graph
+    # search:
+    #   backend: loki
+    # loki:
+    #   url: http://loki:3100 # Address of Loki within the Docker network
+
+# --- Overrides --- (Removed as it caused errors and likely unnecessary for single tenant)
+
+# --- Metrics Generator ---
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+  storage:
+    path: /tmp/tempo/generator/wal
+    remote_write:
+      - url: http://mimir:9009/api/v1/push
+        send_exemplars: true
+  # processors: [service-graphs, span-metrics] # Invalid key here
+
+# --- Auth ---
+auth_enabled: false # Keep auth disabled

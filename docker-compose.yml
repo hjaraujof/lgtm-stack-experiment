@@ -1,0 +1,114 @@
+networks:
+  lgtm-net:
+    driver: bridge
+
+volumes:
+  loki-data:
+    driver_opts:
+      type: none
+      device: ${PWD}/data/loki # Use PWD for host path relative to compose file
+      o: bind
+  tempo-data:
+    driver_opts:
+      type: none
+      device: ${PWD}/data/tempo
+      o: bind
+  mimir-data:
+    driver_opts:
+      type: none
+      device: ${PWD}/data/mimir
+      o: bind
+  grafana-data:
+    driver_opts:
+      type: none
+      device: ${PWD}/data/grafana
+      o: bind
+
+services:
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    ports:
+      - "3100:3100" # Loki HTTP port
+      - "9096:9096" # Loki gRPC port
+    volumes:
+      - ./config/loki-config.yaml:/etc/loki/config.yaml
+      - loki-data:/loki # Mount persistent data volume
+    command: -config.file=/etc/loki/config.yaml
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    ports:
+      # Standard Tempo ports
+      - "3200:3200"   # Tempo HTTP port for UI/API access if needed
+      # - "4317:4317" # REMOVED - OTLP gRPC - Collector will receive this
+      # - "4318:4318" # REMOVED - OTLP HTTP - Collector will receive this
+      # - "14268:14268" # Jaeger Thrift HTTP (optional)
+      # - "9411:9411"   # Zipkin (optional)
+    volumes:
+      - ./config/tempo-config.yaml:/etc/tempo/config.yaml
+      - tempo-data:/tmp/tempo # Mount persistent data volume
+    command: -config.file=/etc/tempo/config.yaml
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+    depends_on:
+      - loki # Optional: Tempo can use Loki for span discovery
+
+  mimir:
+    image: grafana/mimir:latest
+    container_name: mimir
+    # Mimir runs as multiple components; for local dev, run in monolithic mode
+    command: -target=all -config.file=/etc/mimir/config.yaml
+    ports:
+      - "9009:9009" # Mimir HTTP port / Distributor
+      - "9095:9095" # Mimir gRPC port (optional, for internal communication if scaled)
+    volumes:
+      - ./config/mimir-config.yaml:/etc/mimir/config.yaml
+      - mimir-data:/data # Mount persistent data volume
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000" # Grafana HTTP port
+    volumes:
+      - grafana-data:/var/lib/grafana # Mount persistent data volume
+      - ./config/grafana/provisioning/:/etc/grafana/provisioning/ # Mount provisioning files (datasources, dashboards)
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Default credentials, change if needed for security
+      # - GF_LOG_LEVEL=debug # Optional: Increase log level for debugging
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+    depends_on:
+      - loki
+      - tempo
+      - mimir
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest # Use the contrib image for more exporters/receivers
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      # - "13133:13133" # health_check extension
+      # - "55679:55679" # zpages extension
+    networks:
+      - lgtm-net
+    depends_on:
+      - loki
+      - tempo
+      - mimir
+    restart: unless-stopped

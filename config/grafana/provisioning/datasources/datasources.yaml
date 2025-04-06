@@ -1,0 +1,59 @@
+# Grafana datasource provisioning configuration
+
+apiVersion: 1
+
+# List of datasources to insert/update depending on name.
+datasources:
+  # --- Loki Datasource ---
+  - name: Loki
+    type: loki
+    access: proxy # Access through Grafana backend
+    url: http://loki:3100 # Address of Loki service within Docker network
+    jsonData:
+      # Optional: Set derived fields for trace<->logs correlation
+      derivedFields:
+        - datasourceUid: tempo # UID of the Tempo datasource (see below)
+          matcherRegex: traceID=(\w+)
+          name: TraceID # Name of the field in Grafana Explore
+          url: $${__value.raw} # Link using the raw value of the field
+    isDefault: false # Set true if you want Loki to be the default datasource
+
+  # --- Tempo Datasource ---
+  - name: Tempo
+    type: tempo
+    uid: tempo # Explicit UID for linking from Loki
+    access: proxy
+    url: http://tempo:3200 # Address of Tempo service within Docker network
+    jsonData:
+      # Optional: Configure trace to logs linking
+      tracesToLogs:
+        datasourceUid: Loki # UID of the Loki datasource (see above)
+        tags: ['job', 'instance', 'pod', 'namespace'] # Tags to use for log correlation
+        mappedTags: [{ key: 'service.name', value: 'job' }]
+        mapTagNamesEnabled: false
+        spanStartTimeShift: '1h'
+        spanEndTimeShift: '1h'
+        filterByTraceID: true
+        filterBySpanID: false
+      # Optional: Configure service graph connection
+      serviceMap:
+        datasourceUid: Mimir-Prometheus # UID of the Mimir/Prometheus datasource (see below)
+      search:
+        hide: false # Show search tab in Explore
+      # nodeGraph:
+      #   enabled: true # Enable node graph visualization
+    isDefault: false
+
+  # --- Mimir Datasource (as Prometheus) ---
+  - name: Mimir-Prometheus
+    type: prometheus
+    uid: Mimir-Prometheus # Explicit UID for linking from Tempo
+    access: proxy
+    url: http://mimir:9009 # Address of Mimir service within Docker network
+    jsonData:
+      httpMethod: POST # Mimir typically expects POST for queries
+      # Optional: Configure exemplars if Tempo is sending them
+      exemplarTraceIdDestinations:
+        - name: trace_id # Label name Tempo uses for trace ID in exemplars
+          datasourceUid: tempo # UID of the Tempo datasource
+    isDefault: true # Set Mimir/Prometheus as the default datasource

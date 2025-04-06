@@ -1,0 +1,51 @@
+# OpenTelemetry Collector configuration for LGTM stack
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317 # Listen on gRPC port
+      http:
+        endpoint: 0.0.0.0:4318 # Listen on HTTP port
+
+processors:
+  batch: # Batch processor helps with performance and compression
+    send_batch_size: 1024
+    timeout: 1s
+  memory_limiter: # Prevents collector from exceeding memory limits
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 25
+
+exporters:
+  # --- Tempo Exporter (Traces) ---
+  otlphttp/tempo: # Changed exporter type to otlphttp
+    endpoint: http://tempo:4318 # Send traces to Tempo via OTLP HTTP
+    tls:
+      insecure: true # Tempo doesn't use TLS by default
+
+  # --- Loki Exporter (Logs) ---
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push # Send logs to Loki's push API
+
+  # --- Mimir Exporter (Metrics) ---
+  prometheusremotewrite/mimir:
+    endpoint: http://mimir:9009/api/v1/push # Send metrics to Mimir via Prometheus Remote Write
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/tempo] # Use the otlphttp exporter
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite/mimir]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [loki]
+  telemetry: # Configure collector's own telemetry (optional)
+    logs:
+      level: "info"

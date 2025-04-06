@@ -1,0 +1,7 @@
+# Cline specific files
+.clinerules
+memory-bank/
+
+# Ignore contents of data directory, but keep the directory
+data/*
+!data/.gitkeep
