@@ -1,0 +1,365 @@
+# Validate every config this repo deploys.
+#
+# WHY THIS EXISTS: this repo IS the deployment path. Each of these files is bind-mounted into a
+# container by docker compose, so whatever is on the default branch is what the box runs after a
+# `git pull`. A malformed config does not degrade gracefully — it stops the component booting.
+#
+# Blast radius, worst first:
+#   otel-collector-config.yaml  collector will not boot; trace, metric and log ingest all stop
+#   loki/mimir/tempo-config     that backend will not boot; its signal is lost and unqueryable
+#   docker-compose.yml          nothing starts at all
+#   nginx confs                 Grafana unreachable (the HTTPS front door)
+#   user_data.tpl               terraform applies, the instance boots, the stack never starts
+#   grafana provisioning        datasources and dashboards silently absent; the stack looks "up"
+#                               and is blind
+#
+# READ THIS BEFORE YOU ADD OR CHANGE A VALIDATOR. The flags are NOT consistent across the Grafana
+# stack, and every one of them is easy to get wrong in a way that passes vacuously:
+#   loki   -verify-config          a boolean
+#   tempo  -config.verify=true     a VALUE flag. Bare `-config.verify` prints help and EXITS 0.
+#   mimir  -modules                NO verify flag exists. -modules loads and validates, then exits.
+# Read each flag from the image's own -help rather than assume it, and prove each validator FAILS
+# against a deliberately broken config. That is what the positive-control steps below are for.
+#
+# A VALIDATION STEP THAT CANNOT DETECT FAILURE IS WORSE THAN NONE: it reports green forever. Every
+# validator here is therefore paired with a control that asserts rejection, and the controls mutate
+# a copy of the REAL config rather than a fixture, because a fixture drifts out of relevance.
+#
+# Image tags MUST track docker-compose.yml. To validate a different version than production runs is
+# how a config passes CI and fails at boot.
+
+name: config-check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "config/**"
+      - "!config/mimir/rules/**" # covered by mimir-rules-check.yml
+      # Globs, not exact names. An exact-name filter silently skips a NEW deployable the day someone
+      # adds one, and nobody notices because the job still reports green on everything else.
+      - "docker-compose*.yml"
+      - "user_data*.tpl"
+      # scripts/ deploys the Alertmanager tenant config on every stack start. A parse error there
+      # fails the init container while the Alertmanager keeps serving its PREVIOUS config — a silent
+      # no-op deploy that is indistinguishable from a healthy one.
+      - "scripts/**"
+      # Without this, editing only the reconciler test skips the job that runs it. The test would
+      # look green on its own PR while never having executed.
+      - "tests/scripts/**"
+      - ".github/workflows/config-check.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "config/**"
+      - "!config/mimir/rules/**"
+      - "docker-compose*.yml"
+      - "user_data*.tpl"
+      - "scripts/**"
+      - "tests/scripts/**"
+
+permissions:
+  contents: read
+
+env:
+  COLLECTOR_IMAGE: otel/opentelemetry-collector-contrib:0.142.0
+  LOKI_IMAGE: grafana/loki:3.7.3
+  TEMPO_IMAGE: grafana/tempo:3.0.2
+  MIMIR_IMAGE: grafana/mimir:3.1.2
+  NGINX_IMAGE: nginx:1.27-alpine
+  # amtool only. The Alertmanager itself is Mimir's built-in, not this image.
+  ALERTMANAGER_IMAGE: prom/alertmanager:v0.28.1
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  collector:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: validate collector config
+        # -v /:/hostfs:ro is REQUIRED and is not incidental: `validate` instantiates receivers, and
+        # the hostmetrics receiver sets root_path: /hostfs. Without it this fails with
+        # `invalid root_path: stat /hostfs` on a pristine checkout, which reads like your edit.
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/config/otel-collector-config.yaml:/c.yaml:ro" \
+            -v /:/hostfs:ro \
+            "$COLLECTOR_IMAGE" validate --config=/c.yaml
+          echo "OK: collector config loads and every component constructs"
+
+      - name: positive control - validator must reject a broken collector config
+        # Mutates a copy of the REAL config with an undefined OTTL function and asserts rejection.
+        # Fails loudly if the sed anchor stops matching, because a VACUOUS control is the same silent
+        # no-op wearing a different hat.
+        run: |
+          set -euo pipefail
+          sed 's|delete_key(attributes, "service.namespace")|__ottl_control_undefined_fn__(attributes, "x")|' \
+            config/otel-collector-config.yaml > /tmp/broken.yaml
+          if cmp -s config/otel-collector-config.yaml /tmp/broken.yaml; then
+            echo "::error::positive control could not mutate the config - its sed anchor no longer \
+          exists. Point it at any OTTL statement present in the file, or this control is vacuous."
+            exit 1
+          fi
+          if docker run --rm -v /tmp/broken.yaml:/c.yaml:ro -v /:/hostfs:ro \
+               "$COLLECTOR_IMAGE" validate --config=/c.yaml 2>/dev/null; then
+            echo "::error::validator ACCEPTED an undefined OTTL function - the step above is not \
+          checking anything. Do not trust its green result."
+            exit 1
+          fi
+          echo "OK: validator correctly rejects a broken collector config"
+
+  # ---------------------------------------------------------------------------------------------
+  backends:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: verify loki / mimir / tempo configs
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/config/loki-config.yaml:/c.yaml:ro" \
+            --entrypoint loki "$LOKI_IMAGE" -config.file=/c.yaml -verify-config
+          echo "OK: loki"
+          docker run --rm -v "$PWD/config/mimir-config.yaml:/c.yaml:ro" \
+            --entrypoint mimir "$MIMIR_IMAGE" -config.file=/c.yaml -modules >/dev/null
+          echo "OK: mimir"
+          docker run --rm -v "$PWD/config/tempo-config.yaml:/c.yaml:ro" \
+            --entrypoint /tempo "$TEMPO_IMAGE" -config.file=/c.yaml -config.verify=true
+          echo "OK: tempo"
+
+      - name: positive control - each backend validator must reject a broken config
+        # Especially load-bearing for mimir, whose "validator" is really -modules. If a future image
+        # made -modules print without loading the config, mimir would silently stop being checked
+        # while this job kept reporting green. Tempo matters too: bare `-config.verify` (no =true)
+        # prints help and exits 0.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cc
+          for f in loki mimir tempo; do
+            cp "config/$f-config.yaml" "/tmp/cc/$f.yaml"
+            echo '__positive_control_unknown_key__: true' >> "/tmp/cc/$f.yaml"
+          done
+          fail=0
+          if docker run --rm -v /tmp/cc/loki.yaml:/c.yaml:ro --entrypoint loki "$LOKI_IMAGE" \
+               -config.file=/c.yaml -verify-config >/dev/null 2>&1; then
+            echo "::error::loki validator accepted an unknown top-level key"; fail=1
+          fi
+          if docker run --rm -v /tmp/cc/mimir.yaml:/c.yaml:ro --entrypoint mimir "$MIMIR_IMAGE" \
+               -config.file=/c.yaml -modules >/dev/null 2>&1; then
+            echo "::error::mimir -modules accepted an unknown top-level key - it is no longer \
+          validating the config file"; fail=1
+          fi
+          if docker run --rm -v /tmp/cc/tempo.yaml:/c.yaml:ro --entrypoint /tempo "$TEMPO_IMAGE" \
+               -config.file=/c.yaml -config.verify=true >/dev/null 2>&1; then
+            echo "::error::tempo validator accepted an unknown top-level key"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: all three backend validators reject a broken config"
+
+      - name: check the Mimir alertmanager config
+        # config/mimir/alertmanager/demo-am.yaml is not bind-mounted the way config/mimir/rules/ is.
+        # It is loaded through the config API by scripts/init-mimir-alertmanager.sh. A malformed one
+        # breaks alert delivery the moment the reconciler posts it, and amtool checks it for free.
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/config/mimir/alertmanager/demo-am.yaml:/am.yaml:ro" \
+            --entrypoint amtool "$ALERTMANAGER_IMAGE" check-config /am.yaml
+          echo "OK: alertmanager config"
+
+  # ---------------------------------------------------------------------------------------------
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        # Resolves the full model: YAML, interpolation, anchors, profiles, volume and network refs.
+        run: |
+          set -euo pipefail
+          docker compose config -q
+          echo "OK: docker-compose.yml resolves"
+
+  # ---------------------------------------------------------------------------------------------
+  nginx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: nginx -t on every server config
+        # `nginx -t` READS the certs named by ssl_certificate, so a throwaway self-signed pair must
+        # exist at the exact path or the test fails for the wrong reason.
+        #
+        # The template is rendered with sed, NOT envsubst. envsubst is absent on some machines, and
+        # `envsubst < t > out` then yields an EMPTY file, on which `nginx -t` PASSES VACUOUSLY. Hence
+        # the explicit non-empty and no-leftover-placeholder assertions below — both of them have
+        # caught a real false pass.
+        run: |
+          set -euo pipefail
+          DOMAIN=grafana.example.com
+          mkdir -p "/tmp/le/live/$DOMAIN"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$DOMAIN" \
+            -keyout "/tmp/le/live/$DOMAIN/privkey.pem" \
+            -out    "/tmp/le/live/$DOMAIN/fullchain.pem" 2>/dev/null
+
+          sed "s|\${DOMAIN_NAME}|$DOMAIN|g" config/nginx/grafana.conf.template > /tmp/rendered.conf
+          [ -s /tmp/rendered.conf ] \
+            || { echo "::error::rendered template is EMPTY - nginx -t would pass vacuously"; exit 1; }
+          if grep -q '\${' /tmp/rendered.conf; then
+            echo "::error::rendered template still contains \${...} placeholders"; exit 1
+          fi
+
+          for conf in config/nginx/grafana-init.conf /tmp/rendered.conf; do
+            [ -s "$conf" ] || { echo "::error::$conf is empty or missing"; exit 1; }
+            docker run --rm \
+              -v "$PWD/config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+              -v "$(realpath "$conf"):/etc/nginx/conf.d/grafana.conf:ro" \
+              -v "/tmp/le:/etc/letsencrypt:ro" \
+              "$NGINX_IMAGE" nginx -t
+            echo "OK: $conf"
+          done
+
+  # ---------------------------------------------------------------------------------------------
+  json-and-provisioning:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JSON configs and Grafana provisioning parse
+        # GRAFANA PROVISIONING FAILS SILENTLY. A malformed datasource or dashboard file is SKIPPED at
+        # startup, so the stack comes up "healthy" with no datasources and every panel empty. There
+        # is no runtime signal at all, which is exactly why this needs a pre-merge check.
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          n=0
+          for f in config/**/*.json; do
+            jq empty "$f" || { echo "::error::invalid JSON: $f"; exit 1; }
+            n=$((n+1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no JSON configs found - glob is wrong"; exit 1; }
+          echo "OK: $n JSON file(s)"
+
+          python3 - <<'PY'
+          import glob, sys, yaml
+          paths = sorted(glob.glob("config/grafana/provisioning/**/*.yaml", recursive=True))
+          if not paths:
+              print("::error::no Grafana provisioning YAML found - glob is wrong"); sys.exit(1)
+          for p in paths:
+              try:
+                  doc = yaml.safe_load(open(p))
+              except yaml.YAMLError as e:
+                  print(f"::error::{p}: {e}"); sys.exit(1)
+              if not isinstance(doc, dict) or not doc:
+                  print(f"::error::{p}: not a non-empty mapping"); sys.exit(1)
+          print(f"OK: {len(paths)} provisioning file(s)")
+          PY
+
+  # ---------------------------------------------------------------------------------------------
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell-syntax check every script in scripts/
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          found=0
+          for f in scripts/*.sh; do
+            found=$((found + 1))
+            bash -n "$f" || { echo "::error file=$f::bash -n failed"; exit 1; }
+            echo "  OK: $f"
+          done
+          [ "$found" -gt 0 ] || { echo "::error::no scripts/*.sh found - has the layout moved?"; exit 1; }
+          echo "OK: $found script(s) parse"
+
+      - name: positive control - the loop must reject a real parse error
+        # NOTE FOR WHOEVER EDITS THIS: `if [ -z "$x" ; then ...; fi` is NOT a parse error and will
+        # not work as a control. `[` is just a command, and the missing `]` fails at RUNTIME.
+        # `bash -n` only checks GRAMMAR, so the control must be a genuine grammar break.
+        run: |
+          set -euo pipefail
+          printf '#!/bin/bash\nif true; then echo hi\n' > /tmp/_ci_broken.sh
+          if bash -n /tmp/_ci_broken.sh 2>/dev/null; then
+            echo "::error::bash -n accepted an unterminated if - the check above is vacuous"
+            exit 1
+          fi
+          echo "OK: control rejected as expected"
+
+      - name: shellcheck
+        # A GATE. The pre-existing SC2155 findings that justified the old `|| true`
+        # were cleared, so the advisory pass became a hard failure. If this starts
+        # failing, fix the finding rather than restoring `|| true` -- once it is
+        # advisory again nobody reads it.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning scripts/*.sh
+          echo "OK: shellcheck gate passed"
+
+      - name: positive control - shellcheck must reject a known-bad script
+        # Without this, a shellcheck that silently stopped inspecting anything
+        # (bad glob, wrong path, install failure swallowed) would read as a pass.
+        run: |
+          set -euo pipefail
+          printf '#!/bin/bash\nlocal_test() { local x=$(echo hi); echo "$x"; }\n' > /tmp/sc-bad.sh
+          if shellcheck -S warning /tmp/sc-bad.sh; then
+            echo "::error::shellcheck accepted a known SC2155 - the gate above is vacuous"
+            exit 1
+          fi
+          echo "OK: shellcheck correctly rejects a known finding"
+
+      - name: Alertmanager reconciler behaviour
+        # A GATE, not advisory. `bash -n` only proves the file parses. It says nothing about whether
+        # the reconciler still reverts an out-of-band write, or still deploys a `git pull`. Those two
+        # behaviours are the whole reason the loop exists, and both are easy to break with an
+        # innocuous-looking edit that parses, shellchecks and loads cleanly.
+        #
+        # The test speaks the real wire format against a fake Mimir and carries its own NEGATIVE
+        # CONTROL, so it fails if the loop is removed. Stdlib Python only; no install step.
+        run: |
+          set -euo pipefail
+          python3 tests/scripts/test-am-reconcile.py
+
+  # ---------------------------------------------------------------------------------------------
+  user-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell-syntax check the EC2 bootstrap template
+        # A syntax error here is the worst failure mode in the repo to debug: terraform applies
+        # cleanly, the instance boots, and the stack simply never comes up, with the reason buried in
+        # cloud-init logs on a box you have to open a session into.
+        #
+        # RENDERING ORDER MATTERS. Substitute the terraform vars FIRST, then un-escape `$${` to `${`
+        # (which is what templatefile() emits for shell variables). The other way round would expose
+        # shell variables to the terraform substitution pass.
+        run: |
+          set -euo pipefail
+          sed -e 's|\${domain_name}|example.com|g' \
+              -e 's|\${secret_name}|dummy/secret|g' \
+              -e 's|\${certbot_email}|ci@example.com|g' \
+              -e 's|\${bootstrap_bucket}|dummy-bootstrap-bucket|g' \
+              user_data.tpl | sed 's|\$\${|${|g' > /tmp/ud.sh
+
+          [ -s /tmp/ud.sh ] || { echo "::error::rendered user_data is EMPTY"; exit 1; }
+          if grep -qE '\$\{[a-z_]+\}' /tmp/ud.sh; then
+            echo "::error::unsubstituted terraform var(s) remain - a new variable was added to \
+          user_data.tpl without a matching sed line here:"
+            grep -oE '\$\{[a-z_]+\}' /tmp/ud.sh | sort -u
+            exit 1
+          fi
+          bash -n /tmp/ud.sh
+          echo "OK: user_data.tpl is valid bash once rendered"
+
+      - name: positive control - bash -n must reject a real parse error
+        run: |
+          set -euo pipefail
+          printf '#!/bin/bash\nif true; then echo hi\n' > /tmp/ud-broken.sh
+          if bash -n /tmp/ud-broken.sh 2>/dev/null; then
+            echo "::error::bash -n accepted an unterminated if - the check above is vacuous"
+            exit 1
+          fi
+          echo "OK: bash -n correctly rejects a parse error"

@@ -1,0 +1,112 @@
+{
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "description": "Database operations metrics for tenant-a/qa demo-service instance \u26a0\ufe0f SAMPLED (~10%): this environment is tail-sampled at 10% (100% of errors + slow >200ms kept); absolute counts understate true volume \u2014 treat as trend.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [{"asDropdown": true, "icon": "external link", "includeVars": false, "keepTime": true, "tags": ["demo-service", "qa"], "targetBlank": false, "title": "Tenant A QA Dashboards", "tooltip": "", "type": "dashboards", "url": ""}],
+  "panels": [
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0}, "id": 100, "panels": [], "title": "Collection Activity", "type": "row"},
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "description": "Database operations by collection over time",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "operations", "axisPlacement": "auto", "barAlignment": 0, "barWidthFactor": 0.6, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "normal"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 14, "x": 0, "y": 1},
+      "id": 1,
+      "options": {"legend": {"calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
+      "pluginVersion": "11.3.1",
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.collection.name != \"\"} | rate() by (span.db.collection.name)", "refId": "A"}],
+      "title": "Operations by Collection Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "description": "Top models by total call volume",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "fillOpacity": 80, "gradientMode": "hue", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineWidth": 1, "scaleDistribution": {"type": "linear"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 10, "x": 14, "y": 1},
+      "id": 2,
+      "options": {"barRadius": 0.05, "barWidth": 0.7, "fullHighlight": false, "groupWidth": 0.7, "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": false}, "orientation": "horizontal", "showValue": "auto", "stacking": "none", "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 0},
+      "pluginVersion": "11.3.1",
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.collection.name != \"\"} | count_over_time() by (span.db.collection.name) | topk(20)", "refId": "A"}],
+      "title": "Top Collections by Call Volume",
+      "type": "barchart"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9}, "id": 101, "panels": [], "title": "Query Patterns", "type": "row"},
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "description": "Distribution of take values in queries",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 10},
+      "id": 3,
+      "options": {"displayLabels": ["name", "percent"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"]}, "pieType": "donut", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
+      "pluginVersion": "11.3.1",
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.limit > 0} | count_over_time() by (span.db.query.limit)", "refId": "A"}],
+      "title": "Limit Value Distribution",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "description": "Distribution of skip values in queries",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 10},
+      "id": 4,
+      "options": {"displayLabels": ["name", "percent"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"]}, "pieType": "donut", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
+      "pluginVersion": "11.3.1",
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.offset > 0} | count_over_time() by (span.db.query.offset)", "refId": "A"}],
+      "title": "Offset Value Distribution",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "description": "Query complexity breakdown (WHERE and ORDER BY usage)",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 10},
+      "id": 5,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "horizontal", "percentChangeColorMode": "standard", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "showPercentChange": false, "textMode": "auto", "wideLayout": true},
+      "pluginVersion": "11.3.1",
+      "targets": [
+        {"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.has_where = \"true\"} | count_over_time()", "refId": "A"},
+        {"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.has_orderby = \"true\"} | count_over_time()", "refId": "B"}
+      ],
+      "title": "Query Complexity (WHERE / ORDER BY)",
+      "type": "stat"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18}, "id": 102, "panels": [], "title": "Batch Operations", "type": "row"},
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "description": "Batch sizes over time",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "records", "axisPlacement": "auto", "barAlignment": 0, "barWidthFactor": 0.6, "drawStyle": "points", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 6, "scaleDistribution": {"type": "linear"}, "showPoints": "always", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 16, "x": 0, "y": 19},
+      "id": 6,
+      "options": {"legend": {"calcs": ["mean", "max", "sum"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
+      "pluginVersion": "11.3.1",
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.record_count > 0} | avg_over_time(span.db.record_count)", "refId": "A"}],
+      "title": "Batch Sizes Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "description": "Cursor pagination usage rate",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 19},
+      "id": 7,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "percentChangeColorMode": "standard", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "showPercentChange": false, "textMode": "auto", "wideLayout": true},
+      "pluginVersion": "11.3.1",
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.cursor != \"\"} | count_over_time()", "refId": "A"}],
+      "title": "Cursor Pagination Usage",
+      "type": "stat"
+    }
+  ],
+  "preload": false,
+  "refresh": "30s",
+  "schemaVersion": 40,
+  "tags": ["demo-service", "qa"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Demo Service QA - Database Operations",
+  "uid": "demo-service-qa-db",
+  "version": 1
+}

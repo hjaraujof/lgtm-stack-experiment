@@ -1,0 +1,532 @@
+# Stack-health and pipeline-integrity alerts for the Mimir ruler.
+#
+# HOW THESE DEPLOY: config/mimir/rules/ is the ruler's rule source. mimir-config.yaml sets
+# ruler_storage.backend=local pointed at a read-only bind mount of this directory, and the ruler
+# re-scans it every poll_interval. A `git pull` on the box therefore deploys a rule change with no
+# API call and no restart. The Alertmanager config is NOT symmetrical: it is object-store backed and
+# API-loaded, so scripts/init-mimir-alertmanager.sh reconciles it.
+#
+# SERVICE NAME CONVENTION: this stack assumes `service.name` is the compound string
+# `<tenant>/<env>/<component>`, for example `tenant-a/prod/orders-api`. That compound name is the
+# ONLY env-bearing label on the span metrics, because the apps here do not set the
+# `service.namespace` resource attribute. Alerts that must page only for live traffic therefore
+# select the env with a regex on the middle segment: `service_name=~"[^/]+/(prod|uat)/[^/]+"`.
+# If your services do not use this convention, replace that regex everywhere it appears.
+#
+# WHY pre-production envs are excluded from live paging: a qa env is expected-noisy, and a dev env
+# keeps absence and crash alerting only. A pager that fires on qa noise trains its reader to ignore it.
+
+groups:
+  # Visibility for the discard reasons that MimirSamplesDiscarded deliberately excludes.
+  # Keep this recording rule even when it sits near zero. It is the baseline that makes the floor in
+  # MimirDuplicateOrOutOfOrderSamples tunable against a measured residue instead of a guess.
+  - name: self-monitoring-recordings
+    interval: 30s
+    rules:
+      - record: mimir:self_scrape_dup:rate5m
+        expr: sum(rate(cortex_discarded_samples_total{reason=~"sample_duplicate_timestamp|sample-out-of-order"}[5m]))
+
+  - name: stack-alerts
+    interval: 30s
+    rules:
+      # --- Service health, from the unbiased connector RED metrics ---
+      # The spanmetrics connector runs on the full pre-sample stream, so these counts see every
+      # request, not only the tail-sampled ones.
+      #
+      # The numerator is the fraction of inbound HTTP requests answered 5xx, NOT the fraction of all
+      # spans of all kinds that carry an error span status. Those are different questions. See
+      # slo-burn.yaml for the full derivation, and for why a status-code numerator is immune to the
+      # benign-internal-error floor that every span-status ratio carries.
+      - alert: HighServiceErrorRatio
+        expr: service:http_5xx_ratio:5m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: 'PROD/UAT {{ $labels.service_name }} >5% of inbound requests answered 5xx over 5m'
+          runbook_url: 'docs/runbooks/service-error-budget.md'
+
+      # Per-ENDPOINT total failure.
+      #
+      # Every service-level alert in this file and in slo-burn.yaml is an AVERAGE, so all of them are
+      # blind to one shape: ONE endpoint fails 100% of its requests while the healthy endpoints hold
+      # the service average under every threshold. A deploy that drops one required environment
+      # variable 500s exactly one code path and nothing else, and a static liveness health check
+      # answers 200 throughout. Nothing else in this stack can see that.
+      #
+      # DELIBERATELY NOT a ratio with a traffic gate. That instrument was tried twice at service
+      # level and failed. The root cause of an unstable ratio is sample COUNT, not rate, and a
+      # per-ENDPOINT denominator is sparser still. "Zero successes" needs no denominator to be sound:
+      # at more than 5 requests in the window, all of them failing is unambiguous at any volume.
+      #
+      # Immune BY CONSTRUCTION to a benign-error floor, unlike every ratio alert here. A benign
+      # recurring error is interleaved WITH successful spans, so any endpoint that carries it also
+      # has non-error spans, and the `unless` removes it.
+      #
+      # `status_code!="STATUS_CODE_ERROR"` rather than `=="STATUS_CODE_OK"`: a successful span
+      # usually reports STATUS_CODE_UNSET, so a match on OK would read normal traffic as absent.
+      #
+      # Covers TOTAL failure only. Partial endpoint degradation stays uncovered on purpose.
+      - alert: EndpointTotallyFailing
+        expr: |
+          (
+            sum by (service_name, span_name) (
+              increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR",service_name=~"[^/]+/(prod|uat)/[^/]+"}[5m])
+            ) > 5
+          )
+          unless
+          (
+            sum by (service_name, span_name) (
+              increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code!="STATUS_CODE_ERROR",service_name=~"[^/]+/(prod|uat)/[^/]+"}[5m])
+            ) > 0
+          )
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: 'PROD/UAT {{ $labels.service_name }} endpoint {{ $labels.span_name }} has failed 100% of requests for 15m (>5 req/5m, zero successes)'
+          runbook_url: 'docs/runbooks/endpoint-total-failure.md'
+
+      # --- Meta: the traces pipeline itself is dead ---
+      #
+      # READ THIS BEFORE YOU EDIT EITHER PIPELINE-SILENT ALERT. The expression is
+      # `sum(rate(...[10m])) == 0 OR absent_over_time(...[10m])`, and `for:` is 3m, NOT 10m.
+      #
+      # When a scoped slice of the pipeline goes silent, its series stop to receive samples. After
+      # the querier lookback delta (5m by default) those series go STALE and drop out of the instant
+      # vector entirely. Once that happens `rate(...)` has no series at all, `sum(empty) == 0` yields
+      # an EMPTY result rather than true, and a `for: 10m` clause can NEVER accumulate 10 continuous
+      # true-minutes, because the true condition is destroyed at about 5m.
+      #
+      # Two failure modes therefore need two detectors:
+      #   `== 0`                   catches "series present but flat" - the first ~5m.
+      #   `absent_over_time(...)`  catches "series gone stale or absent" - staleness-immune.
+      # `for: 3m` latches inside the present-but-flat window, below the 5m staleness horizon.
+      - alert: SpanMetricsPipelineSilent
+        expr: |
+          sum(rate(traces_span_metrics_calls_total[10m])) == 0
+            or absent_over_time(traces_span_metrics_calls_total[10m])
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: 'No span metrics from otel-collector connectors for 3m+ (traces pipeline down)'
+          runbook_url: 'docs/runbooks/pipeline-silent.md'
+
+      # Live-env-scoped pipeline silence.
+      #
+      # The global alert above fires only when ALL span traffic stops. A pre-production env normally
+      # carries the great majority of volume, so the live-env connectors can go fully dark while qa
+      # keeps the global sum well above zero and the global alert never trips. This closes that gap.
+      # Same staleness-robust form, and the reason is stronger here: scoped away from the noisy env,
+      # this alert would NEVER latch under a plain `== 0` with `for: 10m`.
+      - alert: ProdSpanMetricsPipelineSilent
+        expr: |
+          sum(rate(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])) == 0
+            or absent_over_time(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: 'No PROD/UAT span metrics from otel-collector connectors for 3m+ (live traces pipeline down while a pre-production env may still flow)'
+          runbook_url: 'docs/runbooks/pipeline-silent.md'
+
+      # --- FLOORS: the `== 0` detectors above are necessary but NOT sufficient ---
+      #
+      # THE LESSON: a trickle defeats an equality test.
+      #
+      # Both alerts above test for EXACTLY zero. A partial-failure mode can leave the span-metrics
+      # pipeline effectively dead - RED metrics report a fraction of a percent of real traffic, and
+      # the busiest service reads literally 0/s - while the GLOBAL aggregate holds a small residual
+      # well above zero. Never zero means SpanMetricsPipelineSilent never fires, and the outage stays
+      # invisible to paging for as long as the residue lasts.
+      #
+      # These two close that gap. `> 0 and < N` makes them strictly COMPLEMENTARY to the `== 0`
+      # alerts, so a true total outage pages once (critical) instead of twice. severity=warning and
+      # `for: 30m`, because "implausibly low" is a correctness smell rather than a confirmed outage,
+      # and 30m keeps a brief traffic trough from a page.
+      #
+      # THE THRESHOLDS BELOW ARE PLACEHOLDERS. Set each floor about two orders of magnitude under
+      # your observed normal rate, so a diurnal trough cannot reach it. Better still, once you hold
+      # 7 days of clean history, replace the absolute floor with the self-calibrating form, which is
+      # immune to diurnal and seasonal drift:
+      #   sum(rate(traces_span_metrics_calls_total[10m]))
+      #     < 0.1 * sum(rate(traces_span_metrics_calls_total[10m] offset 7d))
+      - alert: SpanMetricsPipelineImplausiblyLow
+        expr: |
+          sum(rate(traces_span_metrics_calls_total[10m])) > 0
+            and sum(rate(traces_span_metrics_calls_total[10m])) < 10
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Span metrics alive but implausibly low (<10 calls/s global for 30m) - a partial-failure trickle, which is exactly the shape that hides a resource-collapse outage from an ==0 detector. Check duplicate-timestamp discards and collector export health before you trust any RED or SLO number.'
+          runbook_url: 'docs/runbooks/pipeline-silent.md'
+      - alert: ProdSpanMetricsPipelineImplausiblyLow
+        expr: |
+          sum(rate(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])) > 0
+            and sum(rate(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])) < 2
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: 'PROD/UAT span metrics alive but implausibly low (<2 calls/s for 30m) - live RED metrics are probably not trustworthy. A noisy pre-production env will mask this in the global aggregate.'
+          runbook_url: 'docs/runbooks/pipeline-silent.md'
+
+      # --- Application-emitted metrics ---
+      #
+      # A stack can reach a state where EVERY series in Mimir is collector-derived
+      # (traces_span_metrics_*, traces_service_graph_*, otelcol_*, hostmetrics) and no series comes
+      # from an application at all. This is the detector for that state.
+      #
+      # `absent()`, NOT `count(...) == 0`. An empty selector returns NO SERIES, so `count(...) == 0`
+      # never evaluates true and the alert stays permanently silent - the exact false-confidence
+      # shape this rule exists to prevent. `absent()` returns 1 precisely when its argument has no
+      # series.
+      #
+      # THE TRADE-OFF, stated honestly: `count(...) == 0` fails SILENT, and `absent()` fails LOUD on
+      # a selector that has merely gone stale. A metric RENAME is indistinguishable from an outage.
+      # What makes this rule sound is not the operator - it is the selector that covers every name
+      # the fleet actually emits. Both OTel HTTP semconv generations are matched here:
+      #   legacy  http_(server|client)_duration_milliseconds_count     (http.server.duration)
+      #   modern  http_(server|client)_request_duration_seconds_count  (http.server.request.duration)
+      # A selector that names only ONE generation is really tracking "is the last service on old
+      # instrumentation still deployed", and it reports an outage on the day that service upgrades.
+      # Re-verify when instrumentation moves:  count by (__name__) ({__name__=~"http_.*_count"})
+      #
+      # Scoped to the http_* families, because that is what HTTP instrumentation emits. nodejs_* and
+      # process_* runtime metrics need a package many fleets do not install, so a selector that
+      # includes them fires permanently.
+      - alert: ApplicationMetricsAbsent
+        expr: absent(count({__name__=~"http_(server|client)_(duration_milliseconds|request_duration_seconds)_count"}))
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'No application-emitted metrics in Mimir for 15m (http_server/http_client duration families empty). Everything left is collector-derived, so per-service RED from the apps themselves is gone. Check: (1) does the deployed instrumentation package export metrics at all, (2) does the task definition still carry the OTLP metrics endpoint variable, (3) is the collector metrics pipeline exporting.'
+          runbook_url: 'docs/runbooks/pipeline-silent.md'
+
+      # --- Tempo discard tripwires ---
+      - alert: TempoLiveTracesExceeded
+        expr: rate(tempo_discarded_spans_total{reason="live_traces_exceeded"}[5m]) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: 'Tempo dropping spans (live_traces_exceeded) - the disk-full precursor'
+          runbook_url: 'docs/runbooks/tempo-live-traces.md'
+
+      # THE LESSON: a per-reason discard allowlist fails SILENT.
+      #
+      # tempo_discarded_spans_total is a per-REASON counter. A stack that alerts on ONE reason is
+      # blind to every other reason, and the failure mode of that blindness is silence. A single
+      # producer that emits one never-ending root span exceeds max_bytes_per_trace, and Tempo then
+      # discards EVERY span of that trace. The offending service can be 100% blind in Tempo while its
+      # RED metrics stay perfectly healthy, because spanmetrics runs in the collector UPSTREAM of
+      # Tempo. Span metrics can NEVER detect this class. Only the Tempo-side counter can.
+      #
+      # Threshold is >0, not a floor. Unlike the Mimir duplicate-sample residue there is no benign
+      # baseline here: a span Tempo refuses is data loss. `for: 5m` so one oversized trace at a
+      # deploy boundary does not page, but a persistent producer does.
+      #
+      # `by (reason)` keeps the two causes distinguishable, because the remediation differs.
+      # trace_too_large is a PRODUCER bug - an unbounded or never-closed trace. Tempo's own log
+      # prints `msg=TRACE_TOO_LARGE` with the trace id. trace_too_large_to_compact means an
+      # already-stored trace blocks compaction.
+      - alert: TempoTraceTooLarge
+        expr: |
+          sum by (reason) (rate(tempo_discarded_spans_total{reason=~"trace_too_large|trace_too_large_to_compact"}[5m])) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: 'Tempo discarding spans ({{ $labels.reason }}) - a trace exceeded max_bytes_per_trace, so 100% of the offending service''s spans are dropped while its span metrics still look healthy. Almost always ONE producer with a never-ending trace; `docker logs tempo | grep TRACE_TOO_LARGE` names the trace id.'
+          runbook_url: 'docs/runbooks/tempo-trace-too-large.md'
+
+      # The catch-all that makes the two rules above non-exhaustive-safe. Tempo can add a discard
+      # reason in any release, and the failure mode of an allowlist is SILENCE. This fires on any
+      # reason the rules above do not name, so a new one announces itself instead of a quiet loss.
+      # Deliberately warning, not critical: it exists to surface an UNKNOWN, and the first response
+      # is to read the reason label and give it a dedicated rule.
+      - alert: TempoSpansDiscardedUnknownReason
+        expr: |
+          sum by (reason) (
+            rate(tempo_discarded_spans_total{reason!~"live_traces_exceeded|trace_too_large|trace_too_large_to_compact"}[5m])
+          ) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Tempo discarding spans for an UNTRIAGED reason ({{ $labels.reason }}) - not covered by TempoLiveTracesExceeded or TempoTraceTooLarge. Read the reason label and give it a dedicated rule; a per-reason allowlist fails silent.'
+          runbook_url: 'docs/runbooks/tempo-trace-too-large.md'
+
+      # PROACTIVE: warn as live traces approach the max_traces_per_user cap, BEFORE discards start.
+      # Threshold tracks 80% of that cap. If you change max_traces_per_user in tempo-config.yaml,
+      # change this number too, or the alert warns constantly at a healthy new baseline.
+      - alert: TempoLiveTracesHigh
+        expr: sum(tempo_live_store_live_traces) > 32000
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Tempo live-store live traces >32k (80% of the 40k cap) - approaching live_traces_exceeded'
+          runbook_url: 'docs/runbooks/tempo-live-traces.md'
+
+      - alert: TempoCompactionStalled
+        expr: tempodb_compaction_outstanding_blocks > 50
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Tempo compaction backlog >50 blocks for 15m (object-store compactor stall - a silent-failure mode)'
+          runbook_url: 'docs/runbooks/tempo-compaction.md'
+
+      # --- Mimir silent-failure gaps ---
+      #
+      # The ingestion and validation limit watcher. Every reason EXCEPT duplicate-timestamp and
+      # out-of-order still alerts here: rate_limited, per_user_series_limit, sample_out_of_bounds,
+      # greater_than_max_sample_age, and any future reason.
+      #
+      # The exclusion is retained, and it is NOT the last word - MimirDuplicateOrOutOfOrderSamples
+      # below covers what it drops. THE HISTORY IS THE POINT. This exclusion was originally added on
+      # the belief that duplicate-timestamp discards were a benign artifact of the self-monitoring
+      # relay. That premise was wrong by three orders of magnitude, and the blind spot it created
+      # swallowed the largest data-loss event this stack has seen. An "EXPECTED STATE: this
+      # expression yields NO series, that is normal" comment trains the reader to accept silence from
+      # a rule whose blind spot is actively eating data. Never write that comment.
+      - alert: MimirSamplesDiscarded
+        expr: |
+          sum(rate(cortex_discarded_samples_total{reason!~"sample_duplicate_timestamp|sample-out-of-order"}[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Mimir discarding samples for 5m (ingestion limit / validation, excl. duplicate/out-of-order - see MimirDuplicateOrOutOfOrderSamples for those) - RED metrics losing fidelity'
+          runbook_url: 'docs/runbooks/mimir-discards.md'
+
+      # Closes the blind spot that the exclusion above opens.
+      #
+      # Threshold is a FLOOR, not 0, deliberately. A genuine but tiny same-receive-second collision
+      # is possible among the self-scrape gauge series - that is what `honor_timestamps: false` in
+      # otel-collector-config.yaml addresses - and an alert at >0 on that residue is what caused the
+      # original constant firing that motivated the bad exclusion in the first place. 10/s gives
+      # roughly 10x headroom over the residue, and still catches a real collapse by three orders of
+      # magnitude. RETUNE against your own baseline: watch mimir:self_scrape_dup:rate5m for a few
+      # days and set the floor just above its observed ceiling.
+      #
+      # `for: 15m`, not 5m, because this is a fidelity signal rather than a paging emergency, and a
+      # long window avoids a flap on brief deploy-time collisions.
+      - alert: MimirDuplicateOrOutOfOrderSamples
+        expr: |
+          sum(rate(cortex_discarded_samples_total{reason=~"sample_duplicate_timestamp|sample-out-of-order"}[5m])) > 10
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Mimir discarding >10/s samples as duplicate-timestamp/out-of-order for 15m - two writers are colliding on one series (check the spanmetrics resource_metrics_key_attributes first, then app clock skew and double-send). This silently drops app data while stored counters stay monotonic, so dashboards look healthy.'
+          runbook_url: 'docs/runbooks/mimir-discards.md'
+
+      # Symmetric with TempoCompactionStalled. An object-store upload or compaction failure grows the
+      # TSDB head without bound, which ends in an ingester OOM and data loss.
+      - alert: MimirBlockUploadOrCompactionFailing
+        expr: |
+          rate(cortex_ingester_shipper_upload_failures_total[15m]) > 0
+            or rate(cortex_compactor_runs_failed_total[15m]) > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: 'Mimir block upload or compaction failing for 15m (silent data-loss risk - TSDB head unbounded)'
+          runbook_url: 'docs/runbooks/mimir-block-failure.md'
+
+      # Active-series growth is the named RAM-scaling risk. The threshold is 80% of the explicit
+      # max_global_series_per_user in mimir-config.yaml, so this WARNS before Mimir starts to discard
+      # series at the cap. A threshold set ABOVE the cap can never fire - check that the two agree.
+      - alert: MimirActiveSeriesHigh
+        expr: sum(cortex_ingester_memory_series) > 400000
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Mimir active series >400k for 30m (80% of the series cap - cardinality growth; investigate via the cardinality API)'
+          runbook_url: 'docs/runbooks/mimir-cardinality.md'
+
+      # The ONLY rule here that predicts an ingestion-burst failure BEFORE data is lost. Every other
+      # Mimir rule above is a lagging indicator: they fire once samples are already gone.
+      #
+      # MimirActiveSeriesHigh provably cannot cover this. The spanmetrics connector ships its ENTIRE
+      # cache in ONE write each metrics_flush_interval, so the binding constraint is
+      # ingestion_burst_size, and that rejects long before the series alert's threshold is reached.
+      # The series alert can never fire first.
+      #
+      # THE ARITHMETIC, an exact identity you can re-derive: each spanmetrics label combination costs
+      # (number of histogram buckets + 3) samples per flush - 1 calls_total, one per duration bucket,
+      # plus _count and _sum. With the 12 buckets configured in otel-collector-config.yaml that is
+      # 15. So `count(traces_span_metrics_calls_total) * 15` IS the flush payload in samples, and it
+      # is directly comparable to ingestion_burst_size.
+      #
+      # TWO COUPLINGS THIS EXPRESSION CANNOT ENFORCE, both of which you maintain by hand:
+      #   1. 140000 is 70% of ingestion_burst_size in mimir-config.yaml. PromQL cannot read that
+      #      limit. IF YOU CHANGE THE BURST, CHANGE THIS NUMBER.
+      #   2. The 15 is buckets + 3. If explicit_buckets in the spanmetrics connector changes, the
+      #      multiplier changes with it.
+      #
+      # `for: 15m` because one flush across the line is not yet loss - the token bucket absorbs it.
+      # Sustained proximity is what precedes rejection. Deliberately warning, not critical: this
+      # fires while everything still works, which is the entire point.
+      #
+      # HONEST LIMITATION: this reads a Mimir-backed metric, so during an active discard storm it is
+      # fed the same lossy stream as everything else. `count()` over a series SET is far more robust
+      # to that than a `rate()` would be, because the series exist once created. Even so, treat a
+      # suspiciously flat value during an incident as suspect and scrape the collector directly.
+      - alert: SpanMetricsFlushApproachingBurstLimit
+        expr: count(traces_span_metrics_calls_total) * 15 > 140000
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'spanmetrics flush payload >70% of ingestion_burst_size for 15m - the whole cache ships as one write each flush interval, so this WILL start 429ing (the error names the rate but means the burst). Cut cardinality or set metrics_expiration; a bigger burst only buys hours.'
+          runbook_url: 'docs/runbooks/mimir-discards.md'
+
+      # --- Collector self-telemetry ---
+      # These need the collector's own /metrics in Mimir. See the internal-telemetry scrape job and
+      # the filter/internal_metrics allowlist in otel-collector-config.yaml.
+      #
+      # NOTE ON SUFFIXES: a counter lands in Mimir with a _total suffix, because Prometheus remote
+      # write appends it. A gauge (queue_size, queue_capacity) does NOT. A rule that names the wrong
+      # form matches nothing and stays silent forever.
+      #
+      # THE OUTAGE-CATCHER: tail_sampling evicts traces before their decision. This can run at 100%
+      # of traffic for hours, entirely silently, when the collector's own telemetry is not scraped.
+      - alert: CollectorTailSamplingDroppingTraces
+        expr: rate(otelcol_processor_tail_sampling_sampling_trace_dropped_too_early_total[5m]) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: 'otel-collector tail_sampling dropping traces before evaluation (num_traces buffer too small for the trace rate) - traces NOT reaching Tempo'
+          runbook_url: 'docs/runbooks/collector-tail-sampling.md'
+
+      - alert: CollectorExportFailing
+        expr: |
+          rate(otelcol_exporter_send_failed_spans_total[5m]) > 0
+            or rate(otelcol_exporter_send_failed_metric_points_total[5m]) > 0
+            or rate(otelcol_exporter_send_failed_log_records_total[5m]) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: 'otel-collector export failing to a backend (spans/metrics/logs) for 5m - telemetry dropped downstream'
+          runbook_url: 'docs/runbooks/collector-export.md'
+
+      - alert: CollectorQueueSaturated
+        expr: (otelcol_exporter_queue_size / clamp_min(otelcol_exporter_queue_capacity, 1)) > 0.8
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: 'otel-collector export queue >80% full for 10m - backend slow or unreachable, drops imminent'
+          runbook_url: 'docs/runbooks/collector-export.md'
+
+      # --- Loki ---
+      #
+      # Any log that lands on the Loki `fake` tenant is headerless or misrouted telemetry. `fake` is
+      # what Loki uses when a push carries no X-Scope-OrgID, and it routes to whatever the oldest
+      # schema period defines, which is rarely what you want. The collector's Loki exporter sets the
+      # tenant header, so `fake` ingest should be ZERO. This catches the next producer or exporter
+      # that drifts back to headerless.
+      #
+      # The metric is a GAUGE. Recent Loki releases removed the per-tenant received-lines counter, so
+      # the per-tenant signal is now the ingester memory-streams gauge. No rate(), no _total.
+      - alert: LokiTenantFakeIngest
+        expr: sum(loki_ingester_memory_streams{tenant="fake"}) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Loki has active streams on tenant `fake` (headerless or misrouted) - a producer or exporter is not setting X-Scope-OrgID'
+          runbook_url: 'docs/runbooks/loki-discards.md'
+
+      # Loki VALIDATES PER ENTRY. An oversized entry is discarded and counted here, the rest of the
+      # push is still ingested, and the whole request answers 400. That partial-success shape is why
+      # this class goes unnoticed: the service keeps logging normally while a large fraction of its
+      # entries are silently destroyed.
+      #
+      # Deliberately UNSCOPED by reason, for the same lesson as TempoSpansDiscardedUnknownReason. To
+      # scope a discard alert to the one reason seen so far is exactly how the next reason arrives in
+      # silence.
+      - alert: LokiSamplesDiscarded
+        expr: sum by (tenant, reason) (rate(loki_discarded_samples_total[15m])) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'Loki is discarding log entries on tenant {{ $labels.tenant }} (reason={{ $labels.reason }}) at {{ $value | printf "%.2f" }}/s - these entries are permanently lost'
+          runbook_url: 'docs/runbooks/loki-discards.md'
+
+      # --- Alert-path integrity ---
+      #
+      # THE FAILURE THIS EXISTS FOR: the tenant Alertmanager config is replaced with an EMPTY one.
+      # The ruler keeps evaluating and keeps handing alerts to the Alertmanager with zero errors. The
+      # Alertmanager keeps ACCEPTING them. And it dispatches NOTHING, because a config with no route
+      # and no receivers has nowhere to send. Every downstream integration flatlines and nothing
+      # notices, because the only thing that watched the alert path WAS the alert path.
+      #
+      # READ THIS BEFORE YOU TRUST THE TWO ALERTS BELOW. They are evaluated by the ruler and
+      # delivered by the Alertmanager, so in the exact failure they describe they CANNOT be
+      # delivered. Their value is dashboard visibility and PARTIAL failures, where some integrations
+      # are dead and others alive. The real paging protection is out-of-band: the Watchdog heartbeat
+      # at the bottom of this file, plus the CloudWatch alarm on the watchdog topic in alerting.tf.
+      # Do not delete that alarm in the belief that these two cover it.
+      #
+      # `absent(...)` is LOAD-BEARING, not defensive padding. During this outage
+      # cortex_alertmanager_notifications_total does not exist as a series at all, because the
+      # Alertmanager only registers it per integration once it dispatches. A bare `rate(...) == 0`
+      # matches NOTHING when the series is absent, so the naive form of this alert stays silent
+      # through the very incident it exists to catch. Same absent-series trap as the `== 0`
+      # span-metrics detector above.
+      #
+      # THE TWO LOOKBACKS ARE DELIBERATELY DIFFERENT. To make them match reintroduces a false positive.
+      #   ruler side  the ruler re-sends every active alert on each evaluation, so its counter climbs
+      #               continuously and a short 15m window is both safe and responsive.
+      #   AM side     the Alertmanager only dispatches on repeat_interval. Outside an incident the
+      #               ONLY guaranteed traffic is the Watchdog heartbeat, at the repeat_interval set
+      #               for it in demo-am.yaml. A healthy Alertmanager is therefore legitimately silent
+      #               for a whole heartbeat cycle at a stretch.
+      #
+      # THE RULE THAT GENERALISES: a silence detector's window must be WIDER than the cadence of the
+      # traffic it watches. A 15m window against a 30m heartbeat is empty for half of every cycle,
+      # and it leaves only 15m of margin against the 30m `for:`. The moment one cycle stretches - the
+      # dispatcher tick and group_interval both push it out - the alert fires with nothing wrong.
+      # At 2h this tolerates the heartbeat slipping to 4x its configured cadence. IF YOU RAISE
+      # repeat_interval FOR THE WATCHDOG ROUTE, RAISE THIS WITH IT.
+      #
+      # Worst-case detection is 2h30m, still inside the 3h CloudWatch alarm that is the real detector.
+      - alert: AlertDeliverySilent
+        expr: |
+          (sum(rate(cortex_prometheus_notifications_sent_total[15m])) > 0)
+          and
+          (absent(cortex_alertmanager_notifications_total) or sum(increase(cortex_alertmanager_notifications_total[2h])) == 0)
+        for: 30m
+        labels: {severity: critical}
+        annotations:
+          summary: 'Alertmanager is accepting alerts from the ruler but dispatching NONE to any receiver - alert delivery is dead and every other alert in this file is currently going nowhere'
+          runbook_url: 'docs/runbooks/alert-delivery-silent.md'
+
+      # The Alertmanager config is reconciled to config/mimir/alertmanager/demo-am.yaml by the
+      # mimir-am-init container every RECONCILE_INTERVAL_SECS. It only POSTs when the live config
+      # differs from the file, and Mimir derives the tenant config hash from the CONTENT, so an
+      # ordinary redeploy moves nothing. This fires on a REAL content change.
+      #
+      # HOW TO READ IT - count the changes in the window:
+      #   ONE                 a deploy. Someone merged a demo-am.yaml edit and the box pulled it.
+      #   TWO close together  an out-of-band write, reverted within one reconcile interval. The
+      #                       config is already back to git, so the open question is WHO wrote it,
+      #                       not what to restore. `docker logs mimir-am-init | grep DRIFT` gives the
+      #                       time and both sizes.
+      # Read it with:  changes(cortex_alertmanager_config_hash{user="demo"}[1h])
+      #
+      # The one signature this cannot separate from a deploy is an out-of-band write while the
+      # reconciler is DOWN: one change, no revert. `docker ps` on mimir-am-init settles it.
+      #
+      # "Nobody could have written it" is not an argument. Enumerate every network path that reaches
+      # the config API - including the ones that bypass your reverse proxy - and measure them, rather
+      # than assume them.
+      - alert: AlertmanagerConfigChanged
+        expr: changes(cortex_alertmanager_config_hash{user="demo"}[1h]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: 'The Mimir Alertmanager tenant config changed in the last hour - ONE change is a deploy of config/mimir/alertmanager/demo-am.yaml; TWO close together means something wrote it out of band and the reconciler reverted it. Check `docker logs mimir-am-init | grep DRIFT`'
+          runbook_url: 'docs/runbooks/alert-delivery-silent.md'
+
+      # Permanently-firing heartbeat. Its ONLY job is to make the alert path emit a countable publish
+      # on a fixed cadence, so silence downstream is unambiguous rather than "maybe nothing was wrong
+      # this week". demo-am.yaml routes it to a dedicated topic with no human subscription, so it is
+      # invisible to responders; a CloudWatch alarm watches that topic's publish count.
+      #
+      # Deliberately has NO `for:` - it must fire within one evaluation of a cold start.
+      - alert: Watchdog
+        expr: vector(1)
+        labels: {severity: watchdog}
+        annotations:
+          summary: 'Heartbeat - the LGTM alert delivery path is alive. Silence on the watchdog topic means the path is broken, not that the stack is healthy.'
+          runbook_url: 'docs/runbooks/alert-delivery-silent.md'

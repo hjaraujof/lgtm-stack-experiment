@@ -1,0 +1,113 @@
+# promtool unit tests for the SERVER-only latency SLI.
+#
+# MUST NOT live under config/mimir/rules/. That tree is the ruler's rule source
+# (ruler_storage.backend=local, mounted :ro in docker-compose and polled every poll_interval), so any
+# .yaml added there is loaded AS RULES. A test file beside real rules is picked up by the ruler's
+# directory scan.
+#
+# Run:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w:ro" prom/prometheus:v3.1.0 \
+#     test rules /w/tests/mimir-rules/latency-sli.test.yaml
+
+rule_files:
+    - ../../config/mimir/rules/demo/slo-burn.yaml
+
+evaluation_interval: 1m
+
+tests:
+    # THE FALSE-POSITIVE GUARD, and the whole reason the rule carries a span_kind filter.
+    # SERVER spans are 100% under 250ms - the service is genuinely fast for every user - while
+    # INTERNAL spans at 25x the volume, half of them slow, drag an all-kinds ratio to about 0.60 and
+    # breach the SLO for as long as the instrumentation exists.
+    #
+    # Without the span_kind filter this MUST fire. With it, it must stay silent. If someone removes
+    # the filter, this case fails and says why.
+    - interval: 1m
+      input_series:
+          # inbound: 20/min, every one fast
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-b/prod/tasks-api",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+20x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-b/prod/tasks-api",span_kind="SPAN_KIND_SERVER",le="250"}'
+            values: '0+20x200'
+          # internal instrumentation: 500/min, half of it over 250ms
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-b/prod/tasks-api",span_kind="SPAN_KIND_INTERNAL"}'
+            values: '0+500x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-b/prod/tasks-api",span_kind="SPAN_KIND_INTERNAL",le="250"}'
+            values: '0+250x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceLatencySLIBreach
+            exp_alerts: []
+
+    # THE MASKED REGRESSION - the other half of the same defect. 20 inbound req/min = 600 per 30m,
+    # which clears the gate, with only 75% under 250ms. An all-kinds rule cannot see this: a few
+    # hundred FAST internal spans per request dilute 0.75 up past 0.92 and it never crosses 0.95.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-b/prod/orders-api",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+20x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-b/prod/orders-api",span_kind="SPAN_KIND_SERVER",le="250"}'
+            values: '0+15x200'
+          # plenty of fast internal spans; they must not rescue the ratio
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-b/prod/orders-api",span_kind="SPAN_KIND_INTERNAL"}'
+            values: '0+2000x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-b/prod/orders-api",span_kind="SPAN_KIND_INTERNAL",le="250"}'
+            values: '0+2000x200'
+      alert_rule_test:
+          # for: 15m - not yet
+          - eval_time: 10m
+            alertname: ServiceLatencySLIBreach
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceLatencySLIBreach
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      service_name: tenant-b/prod/orders-api
+                  exp_annotations:
+                      summary: 'PROD/UAT tenant-b/prod/orders-api <95% of INBOUND requests under 250ms over 30m at >300 req/30m (latency regression - fires even with zero errors)'
+                      runbook_url: 'docs/runbooks/service-latency.md'
+
+    # Below the sample gate: 5 req/min = 150 per 30m, under 300. Badly slow (20% fast) but far too
+    # few samples for the ratio to mean anything - the sparse-window false-positive class the gate
+    # exists to suppress. Must stay silent.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-a/prod/auth-api",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+5x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-a/prod/auth-api",span_kind="SPAN_KIND_SERVER",le="250"}'
+            values: '0+1x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceLatencySLIBreach
+            exp_alerts: []
+
+    # CLIENT spans are the CALLEE's latency, not ours. A service whose own handlers are fast but
+    # whose outbound calls are slow must NOT breach. To count CLIENT here pages two teams for one
+    # regression, and the downstream service already measures it in its own SLI.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-b/prod/web-portal",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+20x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-b/prod/web-portal",span_kind="SPAN_KIND_SERVER",le="250"}'
+            values: '0+20x200'
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-b/prod/web-portal",span_kind="SPAN_KIND_CLIENT"}'
+            values: '0+40x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-b/prod/web-portal",span_kind="SPAN_KIND_CLIENT",le="250"}'
+            values: '0+10x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceLatencySLIBreach
+            exp_alerts: []
+
+    # Env scoping holds: a qa service with an identical breaching shape must not page.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_duration_milliseconds_count{service_name="tenant-b/qa/orders-api",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+20x200'
+          - series: 'traces_span_metrics_duration_milliseconds_bucket{service_name="tenant-b/qa/orders-api",span_kind="SPAN_KIND_SERVER",le="250"}'
+            values: '0+15x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceLatencySLIBreach
+            exp_alerts: []

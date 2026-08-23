@@ -1,0 +1,76 @@
+# Publish the stack archive to the bootstrap S3 bucket.
+#
+# The EC2 instance fetches this archive at boot (see user_data.tpl) instead of
+# cloning the repo with an SSH key, so no git credential lives on the box.
+# This workflow packages HEAD plus a sha256 and uploads both.
+#
+# Auth is GitHub OIDC into a role scoped to s3:PutObject on these two objects
+# only. Create it out of band; see docs/runbooks/bootstrap-publish-role.md.
+# Do NOT reuse a plan or admin role here — a write-scoped publish role is the
+# whole point, because this bucket is what the instance executes at boot.
+#
+# SETUP: set the repository variables AWS_PUBLISH_ROLE_ARN and
+# BOOTSTRAP_BUCKET. The workflow no-ops with a clear message if they are unset,
+# rather than failing every push on a fork or a fresh clone.
+name: publish-bootstrap
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # manual re-publish, and the one-time initial publish
+
+permissions:
+  id-token: write   # required for OIDC federation to AWS
+  contents: read    # checkout
+
+concurrency:
+  group: publish-bootstrap        # never let two publishes race the same object
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the deployment is configured
+        id: cfg
+        run: |
+          set -euo pipefail
+          if [ -z "${{ vars.AWS_PUBLISH_ROLE_ARN }}" ] || [ -z "${{ vars.BOOTSTRAP_BUCKET }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS_PUBLISH_ROLE_ARN / BOOTSTRAP_BUCKET are not set; skipping publish."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.cfg.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Package the stack archive and checksum
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          # git archive is a clean snapshot of HEAD: it honours .gitattributes
+          # export-ignore and carries no .git directory onto the instance.
+          git archive --format=tar.gz -o lgtm_stack.tar.gz HEAD
+          sha256sum lgtm_stack.tar.gz | cut -d' ' -f1 > lgtm_stack.sha256
+          echo "archive bytes: $(wc -c < lgtm_stack.tar.gz)  sha256: $(cat lgtm_stack.sha256)"
+
+      - name: Upload to the bootstrap bucket
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          BUCKET="${{ vars.BOOTSTRAP_BUCKET }}"
+          # ORDER MATTERS. Upload the checksum FIRST, then the archive. A boot
+          # that reads mid-publish then compares a NEW archive against an OLD
+          # checksum, fails closed, and retries next boot. The reverse order
+          # would let a boot verify an old checksum against a new archive only
+          # by luck, and a mismatch there is indistinguishable from tampering.
+          aws s3 cp lgtm_stack.sha256 "s3://$BUCKET/lgtm_stack.sha256"
+          aws s3 cp lgtm_stack.tar.gz "s3://$BUCKET/lgtm_stack.tar.gz"
+          echo "published to s3://$BUCKET/"

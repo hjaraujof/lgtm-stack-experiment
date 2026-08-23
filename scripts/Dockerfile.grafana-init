@@ -1,0 +1,15 @@
+# Dockerfile for Grafana initialization container
+# Contains AWS CLI, jq, and curl for API operations
+
+FROM amazon/aws-cli:2.17.0
+
+# Install required tools
+RUN yum install -y jq curl && \
+    yum clean all && \
+    rm -rf /var/cache/yum
+
+# Set working directory
+WORKDIR /scripts
+
+# Default entrypoint
+ENTRYPOINT ["/bin/bash"]

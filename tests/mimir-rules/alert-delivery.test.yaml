@@ -1,0 +1,202 @@
+# promtool unit tests for the alert-path integrity rules:
+# AlertDeliverySilent, AlertmanagerConfigChanged, Watchdog, LokiSamplesDiscarded.
+#
+# MUST NOT live under config/mimir/rules/. That tree is the ruler's rule source
+# (ruler_storage.backend=local, mounted :ro in docker-compose and polled every poll_interval), so any
+# .yaml added there is loaded AS RULES. A test file beside real rules is picked up by the ruler's
+# directory scan.
+#
+# Run:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w:ro" prom/prometheus:v3.1.0 \
+#     test rules /w/tests/mimir-rules/alert-delivery.test.yaml
+
+rule_files:
+    - ../../config/mimir/rules/demo/stack-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+    # THE REGRESSION GUARD, and the reason the rule is written with absent().
+    #
+    # The ruler is handing alerts to the Alertmanager perfectly, with zero errors, while the AM
+    # dispatches nothing. So cortex_alertmanager_notifications_total is NEVER CREATED - the AM only
+    # registers that series per integration once it has dispatched at least once.
+    #
+    # NOTE WHAT THIS TEST DOES NOT DEFINE: there is no cortex_alertmanager_notifications_total series
+    # anywhere below. THAT ABSENCE IS THE TEST. A rule written as the obvious
+    # `rate(cortex_alertmanager_notifications_total[15m]) == 0` matches nothing when the series does
+    # not exist, and would stay silent through this exact outage. If someone "simplifies" the
+    # absent() branch away, this case fails and tells them why.
+    - interval: 1m
+      input_series:
+          - series: 'cortex_prometheus_notifications_sent_total{alertmanager="http://localhost:9009/alertmanager/api/v2/alerts",user="demo"}'
+            values: '0+10x90'
+      alert_rule_test:
+          # for: 30m - not yet firing at 20m.
+          - eval_time: 20m
+            alertname: AlertDeliverySilent
+            exp_alerts: []
+          - eval_time: 60m
+            alertname: AlertDeliverySilent
+            exp_alerts:
+                - exp_labels:
+                      severity: critical
+                  exp_annotations:
+                      summary: 'Alertmanager is accepting alerts from the ruler but dispatching NONE to any receiver - alert delivery is dead and every other alert in this file is currently going nowhere'
+                      runbook_url: 'docs/runbooks/alert-delivery-silent.md'
+
+    # The other half of the same failure: the series EXISTS (the AM dispatched at some point in the
+    # past) but has gone flat while the ruler keeps sending. absent() is empty here, so this case is
+    # carried entirely by the `== 0` branch. BOTH BRANCHES ARE NEEDED; neither covers the other.
+    - interval: 1m
+      input_series:
+          - series: 'cortex_prometheus_notifications_sent_total{alertmanager="http://localhost:9009/alertmanager/api/v2/alerts",user="demo"}'
+            values: '0+10x90'
+          - series: 'cortex_alertmanager_notifications_total{integration="sns",user="demo"}'
+            values: '500x90' # constant => rate 0 => dispatching nothing
+      alert_rule_test:
+          - eval_time: 60m
+            alertname: AlertDeliverySilent
+            exp_alerts:
+                - exp_labels:
+                      severity: critical
+                  exp_annotations:
+                      summary: 'Alertmanager is accepting alerts from the ruler but dispatching NONE to any receiver - alert delivery is dead and every other alert in this file is currently going nowhere'
+                      runbook_url: 'docs/runbooks/alert-delivery-silent.md'
+
+    # Healthy path: ruler sending AND AM dispatching. Must stay quiet, or the alert is worthless.
+    - interval: 1m
+      input_series:
+          - series: 'cortex_prometheus_notifications_sent_total{alertmanager="http://localhost:9009/alertmanager/api/v2/alerts",user="demo"}'
+            values: '0+10x90'
+          - series: 'cortex_alertmanager_notifications_total{integration="sns",user="demo"}'
+            values: '0+8x90'
+      alert_rule_test:
+          - eval_time: 60m
+            alertname: AlertDeliverySilent
+            exp_alerts: []
+
+    # THE FALSE-POSITIVE GUARD, and the most transferable case in this file.
+    #
+    # Every "healthy" case above feeds the AM counter a continuous +N-per-minute stream, which is NOT
+    # how a healthy Alertmanager behaves. Outside an incident its only traffic is the Watchdog
+    # heartbeat on repeat_interval, so the counter STEPS once per cycle and is FLAT in between. That
+    # flat stretch is what the alert has to tolerate.
+    #
+    # Modelled here at a 50m cadence. repeat_interval is 30m, but group_interval and the dispatcher
+    # tick push real cycles out. With a 15m AM-side lookback the window is empty for 35m, which
+    # exceeds the 30m `for:`, so the alert fires with nothing wrong.
+    #
+    # THE LESSON: TEST THE BURSTY PATTERN, NOT A CONTINUOUS STREAM. A suite that only feeds a smooth
+    # stream passes happily with this defect in place. This case FAILS if the AM-side window is ever
+    # narrowed back toward repeat_interval.
+    - interval: 1m
+      input_series:
+          - series: 'cortex_prometheus_notifications_sent_total{alertmanager="http://localhost:9009/alertmanager/api/v2/alerts",user="demo"}'
+            values: '0+10x180'
+          # steps at t=10, 60, 110, 160: an early heartbeat, then a 50m cadence
+          - series: 'cortex_alertmanager_notifications_total{integration="sns",user="demo"}'
+            values: '1x9 2x49 3x49 4x49'
+      alert_rule_test:
+          # t=105m sits 45m after the t=60 heartbeat and 5m before the next - the deepest point of
+          # the flat stretch, and where a 15m-window version has already been true for 30m.
+          - eval_time: 105m
+            alertname: AlertDeliverySilent
+            exp_alerts: []
+          - eval_time: 155m
+            alertname: AlertDeliverySilent
+            exp_alerts: []
+
+    # A genuinely idle stack: nothing firing, so the ruler sends nothing. The AM dispatching nothing
+    # is CORRECT here and must not alert. This is what the `sent > 0` guard is for.
+    - interval: 1m
+      input_series:
+          - series: 'cortex_prometheus_notifications_sent_total{alertmanager="http://localhost:9009/alertmanager/api/v2/alerts",user="demo"}'
+            values: '4200x90' # constant: no new notifications, nothing is firing
+      alert_rule_test:
+          - eval_time: 60m
+            alertname: AlertDeliverySilent
+            exp_alerts: []
+
+    # Out-of-band config write: the content hash changes when nobody deployed.
+    - interval: 1m
+      input_series:
+          # hash holds steady, then changes once (the wipe), then holds again
+          - series: 'cortex_alertmanager_config_hash{user="demo"}'
+            values: '270118748568865x30 999999999999999x59'
+      alert_rule_test:
+          - eval_time: 20m
+            alertname: AlertmanagerConfigChanged
+            exp_alerts: []
+          - eval_time: 40m
+            alertname: AlertmanagerConfigChanged
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      user: demo
+                  exp_annotations:
+                      summary: 'The Mimir Alertmanager tenant config changed in the last hour - ONE change is a deploy of config/mimir/alertmanager/demo-am.yaml; TWO close together means something wrote it out of band and the reconciler reverted it. Check `docker logs mimir-am-init | grep DRIFT`'
+                      runbook_url: 'docs/runbooks/alert-delivery-silent.md'
+
+    # A stable config must not alert, or the signal is noise and gets ignored.
+    - interval: 1m
+      input_series:
+          - series: 'cortex_alertmanager_config_hash{user="demo"}'
+            values: '270118748568865x90'
+      alert_rule_test:
+          - eval_time: 60m
+            alertname: AlertmanagerConfigChanged
+            exp_alerts: []
+
+    # Watchdog fires from a cold start with NO input series at all (expr is vector(1)) and has no
+    # `for:`, so it is firing at the first evaluation. If this ever stops being true, the CloudWatch
+    # heartbeat alarm silently becomes a permanent false alarm.
+    - interval: 1m
+      input_series: []
+      alert_rule_test:
+          - eval_time: 1m
+            alertname: Watchdog
+            exp_alerts:
+                - exp_labels:
+                      severity: watchdog
+                  exp_annotations:
+                      summary: 'Heartbeat - the LGTM alert delivery path is alive. Silence on the watchdog topic means the path is broken, not that the stack is healthy.'
+                      runbook_url: 'docs/runbooks/alert-delivery-silent.md'
+
+    # Loki discards. 60/min = exactly 1.00/s, so the $value rendering is pinned.
+    - interval: 1m
+      input_series:
+          - series: 'loki_discarded_samples_total{tenant="demo",reason="structured_metadata_too_large"}'
+            values: '0+60x60'
+      alert_rule_test:
+          - eval_time: 10m
+            alertname: LokiSamplesDiscarded
+            exp_alerts: []
+          - eval_time: 40m
+            alertname: LokiSamplesDiscarded
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      tenant: demo
+                      reason: structured_metadata_too_large
+                  exp_annotations:
+                      summary: 'Loki is discarding log entries on tenant demo (reason=structured_metadata_too_large) at 1.00/s - these entries are permanently lost'
+                      runbook_url: 'docs/runbooks/loki-discards.md'
+
+    # A SECOND reason, deliberately. This proves the rule is not scoped to whichever reason was hit
+    # first - the same lesson as TempoSpansDiscardedUnknownReason. A per-reason allowlist fails silent.
+    - interval: 1m
+      input_series:
+          - series: 'loki_discarded_samples_total{tenant="demo",reason="rate_limited"}'
+            values: '0+60x60'
+      alert_rule_test:
+          - eval_time: 40m
+            alertname: LokiSamplesDiscarded
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      tenant: demo
+                      reason: rate_limited
+                  exp_annotations:
+                      summary: 'Loki is discarding log entries on tenant demo (reason=rate_limited) at 1.00/s - these entries are permanently lost'
+                      runbook_url: 'docs/runbooks/loki-discards.md'

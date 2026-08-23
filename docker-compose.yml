@@ -1,0 +1,366 @@
+networks:
+  lgtm-net:
+    driver: bridge
+
+volumes:
+  loki-data: {}
+    # driver_opts:
+    #   type: none
+    #   device: ${PWD}/data/loki # Use PWD for host path relative to compose file
+    #   o: bind
+  tempo-data: {}
+    # driver_opts:
+    #   type: none
+    #   device: ${PWD}/data/tempo
+    #   o: bind
+  mimir-data: {}
+    # driver_opts:
+    #   type: none
+    #   device: ${PWD}/data/mimir
+    #   o: bind
+  grafana-data: {}
+    # driver_opts:
+    #   type: none
+    #   device: ${PWD}/data/grafana
+    #   o: bind
+  certbot-etc: {}    # Let's Encrypt certificates
+  certbot-www: {}    # ACME challenge webroot
+  otelcol-queue: {}  # disk-backed persistent sending queue for the collector (survives a restart)
+
+services:
+  # Tempo runs as user 10001, and docker compose creates the volume as root.
+  # As such, we need to chown the volume in order for Tempo to start correctly.
+  #
+  # USES busybox, NOT THE TEMPO IMAGE. Grafana's images went distroless: Tempo 3.x ships only the
+  # binary, with no chown and no shell. Reusing the service image here via a YAML anchor breaks the
+  # day you upgrade, with `exec: chown not found` — and it breaks at volume-init time, before
+  # anything useful has started. Keep the init containers on a plain busybox.
+  init:
+    image: busybox:stable
+    user: root
+    entrypoint:
+      - "chown"
+      - "10001:10001"
+      - "/var/tempo"
+    volumes:
+      - tempo-data:/var/tempo
+
+  # The collector runs as UID 10001 (distroless) but a fresh named volume is root-owned, so create
+  # and chown the persistent-queue directory before the collector starts. Same pattern as init.
+  init-otelcol-queue:
+    image: busybox:stable
+    user: root
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /var/lib/otelcol/queue && chown -R 10001:10001 /var/lib/otelcol"]
+    volumes:
+      - otelcol-queue:/var/lib/otelcol
+
+  # Loki also runs as user 10001 and needs volume permissions fixed.
+  # busybox for the same reason as init above — recent Loki images are distroless too.
+  init-loki:
+    image: busybox:stable
+    user: root
+    entrypoint:
+      - "chown"
+      - "-R"
+      - "10001:10001"
+      - "/tmp/loki"
+    volumes:
+      - loki-data:/tmp/loki
+
+  loki:
+    image: grafana/loki:3.7.3
+    container_name: loki
+    ports:
+      - "3100:3100" # Loki HTTP port
+      - "9096:9096" # Loki gRPC port
+    volumes:
+      - ./config/loki-config.yaml:/etc/loki/config.yaml
+      - loki-data:/tmp/loki # Mount persistent data volume
+    command: -config.file=/etc/loki/config.yaml
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+    depends_on:
+      init-loki:
+        condition: service_completed_successfully
+    # NO CONTAINER HEALTHCHECK. Recent Loki images are distroless — no wget, no shell — so a
+    # `CMD-SHELL wget` healthcheck cannot run and the container reports unhealthy forever, which
+    # blocks every dependent that waits on service_healthy. Readiness is checked externally at
+    # http://localhost:3100/ready; dependents use service_started.
+
+  tempo:
+    image: grafana/tempo:3.0.2
+    container_name: tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP port for UI/API access if needed
+    volumes:
+      - ./config/tempo-config.yaml:/etc/tempo/config.yaml
+      - tempo-data:/var/tempo
+    command: -config.file=/etc/tempo/config.yaml
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      loki:
+        condition: service_started   # Loki image is distroless (no healthcheck); ready-check is external
+    # NO CONTAINER HEALTHCHECK — Tempo 3.x is distroless too. Same reasoning as Loki above.
+    # Health is checked externally at http://localhost:3200/ready.
+
+  mimir:
+    image: &mimirImage grafana/mimir:3.1.2
+    container_name: mimir
+    # Mimir runs as multiple components; for local dev, run in monolithic mode
+    command: -target=all,alertmanager -config.file=/etc/mimir/config.yaml
+    ports:
+      - "9009:9009" # Mimir HTTP port / Distributor
+      - "9095:9095" # Mimir gRPC port (optional, for internal communication if scaled)
+    volumes:
+      - ./config/mimir-config.yaml:/etc/mimir/config.yaml
+      # THE GIT-TRACKED RULES, MOUNTED READ-ONLY, ARE THE RULER'S ONLY RULE SOURCE.
+      # Without this mount, config/mimir/rules/ is a directory nothing reads, and the live ruler is
+      # an independent copy that only a manual API POST ever updates. `:ro` is deliberate: the
+      # `local` ruler_storage backend is read-only by design, and that is the point. See the long
+      # note on ruler_storage in config/mimir-config.yaml.
+      - ./config/mimir/rules:/etc/mimir/rules:ro
+      - mimir-data:/tmp/mimir # Mount persistent data volume
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+    # Note: Mimir uses distroless image without wget/curl, so we skip healthcheck
+    # and use service_started condition for dependents. Mimir has internal readiness
+    # checks and typically starts within 20 seconds.
+
+  grafana:
+    image: grafana/grafana:12.3.0
+    container_name: grafana
+    ports:
+      - "3000:3000" # Grafana HTTP port
+    volumes:
+      - grafana-data:/var/lib/grafana # Mount persistent data volume
+      - ./config/grafana/provisioning/:/etc/grafana/provisioning/ # Mount provisioning files (datasources, dashboards)
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      # On EC2, user_data writes the real password into .env from Secrets Manager
+      # before compose starts. Local dev falls back to admin/admin.
+      #
+      # This same file runs the internet-facing `ssl` profile on EC2, so do NOT
+      # hardcode a value here. Use scripts/setup-local-env.sh to generate .env.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      # - GF_LOG_LEVEL=debug # Optional: Increase log level for debugging
+      # Reverse proxy settings (required when running behind NGINX)
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3000}
+      - GF_SERVER_DOMAIN=${DOMAIN_NAME:-localhost}
+    networks:
+      - lgtm-net
+    restart: unless-stopped
+    depends_on:
+      loki:
+        condition: service_started   # distroless image, no healthcheck; ready-check is external
+      tempo:
+        condition: service_started   # distroless image, no healthcheck; ready-check is external
+      mimir:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  otel-collector:
+    # Note: scratch-based image has no shell, healthcheck disabled to prevent dockerd CPU spikes
+    # Health can be checked externally via http://localhost:13133/
+    image: otel/opentelemetry-collector-contrib:0.142.0
+    container_name: otel-collector
+    # BOUND THE COLLECTOR'S MEMORY, AND KNOW WHY.
+    #
+    # Without a container mem_limit, the memory_limiter processor's `limit_percentage: 75` resolves
+    # against the WHOLE HOST's RAM. On a large host that is a soft cap so high it NEVER TRIGGERS, and
+    # the processor you added for protection does nothing at all. mem_limit sets a real cgroup limit,
+    # so limit_percentage resolves against something meaningful.
+    #
+    # GOMEMLIMIT, GOGC AND mem_limit MUST MOVE TOGETHER, and each does a different job:
+    #   GOGC       paces the garbage collector. The default of 100 collects at 2x live heap, which on
+    #              a high-allocation stream means a high GC frequency and real CPU cost. Raising it
+    #              trades RAM for CPU.
+    #   GOMEMLIMIT a BACKSTOP, not a pacer. If it sits above what the heap ever reaches, it is INERT
+    #              and GC is paced entirely by GOGC. Set it above the heap target GOGC implies.
+    #   mem_limit  must hold the GOMEMLIMIT target without an OOM kill.
+    #
+    # Before tuning any of these, profile. The collector's pprof endpoint (127.0.0.1:1777) attributes
+    # CPU to a real cause; guessing does not. A common finding is that most CPU goes to decoding
+    # OTLP/JSON and to the GC servicing that garbage — in which case switching producers to
+    # http/protobuf is the real lever, and every collector-side knob is a workaround.
+    mem_limit: 6g
+    environment:
+      - GOMEMLIMIT=5200MiB
+      - GOGC=400
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+      - otelcol-queue:/var/lib/otelcol   # persistent sending queue (file_storage extension)
+      - /:/hostfs:ro                     # hostmetrics reads host stats via root_path /hostfs
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "13133:13133" # Health check extension (query externally)
+      # Bound to LOOPBACK ON THE HOST on purpose. pprof and zpages expose internal state and are not
+      # authenticated, so they must not be reachable from the network.
+      - "127.0.0.1:1777:1777"   # pprof
+      - "127.0.0.1:55679:55679" # zpages
+    networks:
+      - lgtm-net
+    depends_on:
+      init-otelcol-queue:
+        condition: service_completed_successfully
+      loki:
+        condition: service_started   # distroless image, no healthcheck; ready-check is external
+      tempo:
+        condition: service_started   # distroless image, no healthcheck; ready-check is external
+      mimir:
+        condition: service_started
+    restart: unless-stopped
+    # Healthcheck disabled: scratch image has no shell/wget, causing dockerd CPU spikes
+    # The collector exposes health at :13133 which can be monitored externally
+
+  # Grafana initialization: creates default team and users
+  # Uses env vars from .env file (AWS) or falls back to Secrets Manager (local dev)
+  # This runs once after Grafana is healthy and exits
+  grafana-init:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.grafana-init
+    container_name: grafana-init
+    entrypoint: ["/bin/bash", "/scripts/init-grafana.sh"]
+    volumes:
+      - ./scripts/init-grafana.sh:/scripts/init-grafana.sh:ro
+      - ./config/grafana/users-config.json:/config/users-config.json:ro
+      - ~/.aws:/root/.aws:ro  # Mount AWS credentials (for local dev fallback)
+    environment:
+      - GRAFANA_URL=http://grafana:3000
+      - CONFIG_FILE=/config/users-config.json
+      - SECRET_PATH=/example/dev/lgtm-stack
+      # These come from .env file on AWS, empty locally (falls back to Secrets Manager)
+      - GRAFANA_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-}
+      - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-}
+      - DEFAULT_MEMBER_PASSWORD=${DEFAULT_MEMBER_PASSWORD:-}
+    networks:
+      - lgtm-net
+    depends_on:
+      grafana:
+        condition: service_healthy
+    restart: "no"
+
+  # MIMIR ALERTMANAGER RECONCILER. Keeps the tenant config EQUAL to the git-tracked file, through the
+  # config API. Loads once at start, then re-checks every RECONCILE_INTERVAL_SECS.
+  #
+  # WHY THIS SERVICE EXISTS. config/mimir/rules/ is bind-mounted and IS the ruler's source, so
+  # `git pull` deploys rules. The Alertmanager config CANNOT be bind-mounted the same way:
+  # alertmanager_storage must stay on object storage, because the Alertmanager persists its own
+  # silences and notification log there and a read-only local backend would lose both. So the config
+  # is pushed through the config API instead.
+  #
+  # WHY IT IS LONG-RUNNING RATHER THAN ONE-SHOT. A one-shot loader makes `git pull` deploy HALF a
+  # commit: the ruler picks new rules off its bind mount within poll_interval, while the Alertmanager
+  # config sits unchanged until somebody re-runs the container. Long-running restores the symmetry —
+  # and because the mount below is the live host file, a `git pull` alone now deploys both planes.
+  # It also means an out-of-band write is REVERTED within one interval instead of surviving
+  # indefinitely. See scripts/init-mimir-alertmanager.sh and docs/runbooks/alert-delivery-silent.md.
+  #
+  # Reuses Dockerfile.grafana-init purely for its toolchain (bash, curl, jq); no new base image.
+  # depends_on is start-only, because mimir has no healthcheck; the script polls /ready itself.
+  mimir-am-init:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.grafana-init
+    container_name: mimir-am-init
+    entrypoint: ["/bin/bash", "/scripts/init-mimir-alertmanager.sh"]
+    volumes:
+      - ./scripts/init-mimir-alertmanager.sh:/scripts/init-mimir-alertmanager.sh:ro
+      - ./config/mimir/alertmanager/demo-am.yaml:/config/demo-am.yaml:ro
+    environment:
+      - MIMIR_URL=http://mimir:9009
+      - TENANT=demo
+      - AM_CONFIG_FILE=/config/demo-am.yaml
+      # Mirrors ruler.poll_interval in config/mimir-config.yaml, so both config planes converge on
+      # git at the same cadence. This is also the ceiling on how long an out-of-band write survives.
+      - RECONCILE_INTERVAL_SECS=60
+    networks:
+      - lgtm-net
+    depends_on:
+      - mimir
+    restart: unless-stopped
+
+  # =============================================================================
+  # SSL/TLS - NGINX Reverse Proxy with Let's Encrypt
+  # =============================================================================
+  # These services are enabled via ENABLE_SSL=true environment variable
+  # For local development, SSL is typically not needed
+
+  # NGINX reverse proxy for SSL termination
+  # Proxies HTTPS traffic to Grafana
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    ports:
+      - "80:80"     # HTTP (ACME challenge + redirect)
+      - "443:443"   # HTTPS
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # conf.d is a HOST DIRECTORY, not a bind-mounted file. scripts/render-nginx-ssl.sh
+      # writes the rendered server config into it from the host, and nginx reloads.
+      #
+      # Do NOT go back to bind-mounting grafana-init.conf onto conf.d/grafana.conf: a
+      # single-file bind mount made the SSL switch write THROUGH the mount and overwrite
+      # a version-controlled file at runtime. The directory mount keeps the rendered
+      # output out of git and off the template.
+      - ./config/nginx/conf.d:/etc/nginx/conf.d
+      - ./config/nginx/grafana.conf.template:/config/grafana.conf.template:ro
+      - ./config/nginx/grafana-init.conf:/config/grafana-init.conf:ro
+      - certbot-etc:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot:ro
+    networks:
+      - lgtm-net
+    depends_on:
+      grafana:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - ssl  # Only starts when SSL profile is active
+
+  # Certbot for Let's Encrypt certificate management
+  # Obtains and renews SSL certificates automatically.
+  # The Docker socket is mounted so the deploy-hook in scripts/renew-certs.sh
+  # can run `docker exec nginx nginx -s reload` after a successful renewal —
+  # otherwise nginx keeps serving the old (cached) cert until the container restarts.
+  certbot:
+    image: certbot/certbot:latest
+    container_name: certbot
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+      - ./scripts/init-certbot.sh:/scripts/init-certbot.sh:ro
+      - ./scripts/renew-certs.sh:/scripts/renew-certs.sh:ro
+      - ./config/nginx/grafana.conf.template:/etc/nginx/templates/grafana.conf.template:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOMAIN_NAME=${DOMAIN_NAME:-grafana.example.com}
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL:-devops@example.com}
+      - STAGING=${CERTBOT_STAGING:-0}
+    # Run certificate renewal check every 12 hours.
+    # Install docker-cli on startup so the renew-certs.sh deploy-hook can reload nginx.
+    entrypoint: /bin/sh -c "apk add --no-cache docker-cli >/dev/null 2>&1 || true; trap exit TERM; while :; do /scripts/renew-certs.sh; sleep 12h & wait $${!}; done"
+    networks:
+      - lgtm-net
+    depends_on:
+      - nginx
+    restart: unless-stopped
+    profiles:
+      - ssl  # Only starts when SSL profile is active

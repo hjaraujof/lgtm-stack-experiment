@@ -1,0 +1,244 @@
+# promtool unit tests for the HTTP-status-code availability SLI.
+#
+# WHAT THESE GUARD. Two failure shapes that a span-status availability rule cannot distinguish:
+#   1. Clean SERVER responses under a mountain of erroring INTERNAL spans. A span-status rule pages;
+#      the service is fine.
+#   2. A sustained 401 outage. A span-status rule sees nothing, because under OTel semconv a 4xx does
+#      not set SERVER span status to Error. The service is broken and every rule reads healthy.
+#
+# MUST NOT live under config/mimir/rules/. That tree is the ruler's rule source
+# (ruler_storage.backend=local, mounted :ro in docker-compose and polled every poll_interval), so any
+# .yaml added there is loaded AS RULES. A test file beside real rules is picked up by the ruler's
+# directory scan.
+#
+# Run:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w:ro" prom/prometheus:v3.1.0 \
+#     test rules /w/tests/mimir-rules/error-sli.test.yaml
+
+# ORDER MATTERS. red-recording.yaml records service:http_5xx_ratio:5m, which slo-burn.yaml's
+# ServiceErrorBudgetFastBurn consumes in the same evaluation tick. promtool evaluates groups in the
+# order listed, so a recording file must precede its consumer, or the alert silently sees no series.
+rule_files:
+    - ../../config/mimir/rules/demo/red-recording.yaml
+    - ../../config/mimir/rules/demo/slo-burn.yaml
+    - ../../config/mimir/rules/demo/stack-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+    # ---------------------------------------------------------------------------------------
+    # THE REGRESSION GUARD. Clean SERVER responses, a mountain of erroring INTERNAL spans.
+    #
+    # Under a span-status rule over every span kind the ratio is 500/(500+20) = 0.96 and this pages.
+    # Under the status-code rule it is 0/20 = 0. If someone reverts the numerator to span status, or
+    # drops the span_kind filter, this case fails and says why.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          # 20 inbound req/min, every one a clean 200
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200",status_code="STATUS_CODE_UNSET"}'
+            values: '0+20x200'
+          # 500 erroring INTERNAL spans/min - decorated method spans, not requests. 25x the inbound
+          # volume, which is a realistic ratio for a deeply instrumented service.
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_kind="SPAN_KIND_INTERNAL",status_code="STATUS_CODE_ERROR"}'
+            values: '0+500x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetSlowBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceAuthFailureRateHigh
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # A real 5xx regression must still page. 20 req/min with 3/min answered 500 = 15%, over the
+    # 14.4% fast-burn line on both the 1h and 5m windows.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/prod/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+17x200'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/prod/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="500"}'
+            values: '0+3x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts:
+                - exp_labels:
+                      severity: critical
+                      service_name: tenant-b/prod/orders-api
+                  exp_annotations:
+                      summary: 'PROD/UAT tenant-b/prod/orders-api burning error budget fast (>14.4% of inbound requests 5xx, 1h+5m) - 99% SLO at risk within ~2d'
+                      runbook_url: 'docs/runbooks/service-error-budget.md'
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      service_name: tenant-b/prod/orders-api
+                  exp_annotations:
+                      summary: 'PROD/UAT tenant-b/prod/orders-api >5% of inbound requests answered 5xx over 5m'
+                      runbook_url: 'docs/runbooks/service-error-budget.md'
+          # 5xx is an availability breach, never an auth one.
+          - eval_time: 90m
+            alertname: ServiceAuthFailureRateHigh
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # THE INCIDENT A SPAN-STATUS STACK CANNOT SEE. 401s only: the service is up and answering, so
+    # availability must stay clean, but the auth alert must fire. 25% of 20 req/min are 401, and
+    # 600 req/30m clears the 150 gate.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+15x200'
+          # 401 leaves span status UNSET under OTel semconv - that is exactly why span-status rules
+          # are blind to this. Encoded here so the test fails if anyone "fixes" it to ERROR.
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="401",status_code="STATUS_CODE_UNSET"}'
+            values: '0+5x200'
+      alert_rule_test:
+          # for: 15m - not yet at 10m
+          - eval_time: 10m
+            alertname: ServiceAuthFailureRateHigh
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceAuthFailureRateHigh
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      service_name: tenant-a/prod/auth-api
+                  exp_annotations:
+                      summary: 'PROD/UAT tenant-a/prod/auth-api answering >10% of inbound requests 401/403 over 30m at >150 req/30m (auth broken - NOT an availability breach, and invisible to span status)'
+                      runbook_url: 'docs/runbooks/service-auth-failures.md'
+          # THE POINT OF SPLITTING THE TWO ALERTS: a 401 storm must not burn the availability budget.
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetSlowBurn
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # Auth-alert sample gate. Same 25% 401 rate, but 4 req/min = 120 per 30m, under the 150 gate.
+    # Ten 401s in half an hour on a near-idle service is one caller retrying, not an outage.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/support-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+3x200'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/support-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="401"}'
+            values: '0+1x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceAuthFailureRateHigh
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # THE COVERAGE TRIPWIRE. A server-rendered web front end emits SERVER spans from its framework's
+    # own tracing: no http.response.status_code, no http.request.method, span status UNSET even on
+    # failure. 100 req/min = 3000 per 30m, well over the 300 gate.
+    #
+    # The availability SLI must produce NO SERIES for this service rather than a healthy-looking 0
+    # (which is what dividing by ALL SERVER spans would give), and the gap must be VISIBLE.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/web-app",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_UNSET"}'
+            values: '0+100x200'
+      promql_expr_test:
+          # No series at all - NOT a 0. A 0 would read as "measured, and fine".
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:30m{service_name="tenant-a/prod/web-app"}
+            exp_samples: []
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceAvailabilitySLIUnmeasurable
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      service_name: tenant-a/prod/web-app
+                  exp_annotations:
+                      summary: 'PROD/UAT tenant-a/prod/web-app serves >300 inbound req/30m but emits NO http.response.status_code - it is invisible to the availability SLO and has no server-side failure signal'
+                      runbook_url: 'docs/runbooks/service-error-budget.md'
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # The tripwire must NOT fire for a service that does emit status codes - otherwise it pages for
+    # every healthy service in the fleet.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/prod/inventory-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+100x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceAvailabilitySLIUnmeasurable
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # Slow burn on the 6h+30m pair. 8% of requests 5xx: over the 6% line, under the 14.4% fast-burn
+    # line, so it tickets and does not page. eval_time 400m so the 6h window is genuinely populated.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/uat/tasks-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+23x450'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/uat/tasks-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="503"}'
+            values: '0+2x450'
+      alert_rule_test:
+          - eval_time: 400m
+            alertname: ServiceErrorBudgetSlowBurn
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      service_name: tenant-b/uat/tasks-api
+                  exp_annotations:
+                      summary: 'PROD/UAT tenant-b/uat/tasks-api burning error budget (>6% of inbound requests 5xx, 6h+30m) - 99% SLO trending to breach'
+                      runbook_url: 'docs/runbooks/service-error-budget.md'
+          # 8% is under the 14.4% fast-burn line - slow burn tickets, it must not also page.
+          - eval_time: 400m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # Env scoping holds: a qa service with an identical breaching shape must not reach live alerting
+    # on any of these alerts.
+    # ---------------------------------------------------------------------------------------
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/qa/auth-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+10x200'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/qa/auth-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="500"}'
+            values: '0+5x200'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/qa/auth-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="401"}'
+            values: '0+5x200'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/qa/web-app",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+100x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceAuthFailureRateHigh
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceAvailabilitySLIUnmeasurable
+            exp_alerts: []

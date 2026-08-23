@@ -1,0 +1,49 @@
+{
+  "team": {
+    "name": "Dev",
+    "email": ""
+  },
+  "users": [
+    {
+      "login": "admin@example.com",
+      "name": "Admin User",
+      "email": "admin@example.com",
+      "role": "Admin",
+      "passwordKey": "default_admin_password"
+    },
+    {
+      "login": "editor1@example.com",
+      "name": "Editor One",
+      "email": "editor1@example.com",
+      "role": "Editor",
+      "passwordKey": "default_member_password"
+    },
+    {
+      "login": "admin2@example.com",
+      "name": "Admin Two",
+      "email": "admin2@example.com",
+      "role": "Admin",
+      "passwordKey": "default_admin_password"
+    },
+    {
+      "login": "editor2@example.com",
+      "name": "Editor Two",
+      "email": "editor2@example.com",
+      "role": "Editor",
+      "passwordKey": "default_member_password"
+    },
+    {
+      "login": "editor3@example.com",
+      "name": "Editor Three",
+      "email": "editor3@example.com",
+      "role": "Editor",
+      "passwordKey": "default_member_password"
+    }
+  ],
+  "secretsManager": {
+    "secretPath": "/example/dev/lgtm-stack",
+    "grafanaAdminPasswordKey": "default_grafana_admin_password",
+    "adminPasswordKey": "default_admin_password",
+    "memberPasswordKey": "default_member_password"
+  }
+}

@@ -1,0 +1,106 @@
+# Validate the Mimir ruler's rule files.
+#
+# WHY THIS EXISTS: `config/mimir/rules/` IS the deployment path. The ruler uses
+# ruler_storage.backend=local pointed at a read-only bind mount of that directory, so whatever is on
+# the default branch is what evaluates on the box after a `git pull`. That removes the old drift
+# problem, where rules were hand-loaded into a Docker volume through the config API and git deployed
+# nothing. But it MOVES the failure mode: a malformed or semantically invalid rule file merged to the
+# default branch now breaks rule loading at ruler startup, instead of being rejected by an API call.
+#
+# promtool is the same parser Prometheus and Mimir use, so `check rules` catches bad YAML,
+# unparseable PromQL, duplicate group names and invalid label or annotation templates before merge.
+
+name: mimir-rules-check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'config/mimir/rules/**'
+      - 'tests/mimir-rules/**'
+      - '.github/workflows/mimir-rules-check.yml'
+  push:
+    branches: [main, master]
+    paths:
+      - 'config/mimir/rules/**'
+      - 'tests/mimir-rules/**'
+
+permissions:
+  contents: read
+
+jobs:
+  check-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: promtool check rules
+        # A PINNED image rather than `latest`, so a Prometheus release cannot silently change what
+        # passes. `--entrypoint promtool` because the image's default entrypoint is prometheus itself.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(config/mimir/rules/demo/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no rule files found under config/mimir/rules/demo/ - the ruler would load nothing"
+            exit 1
+          fi
+          echo "Checking ${#files[@]} rule file(s): ${files[*]}"
+          docker run --rm -v "$PWD:/w:ro" -w /w --entrypoint promtool \
+            prom/prometheus:v3.1.0 check rules "${files[@]}"
+
+      - name: promtool test rules
+        # `check rules` above is SYNTAX ONLY. A rule change can invert an alert's meaning and keep
+        # every syntax check green, so the unit tests under tests/mimir-rules/ are what guard
+        # behaviour.
+        #
+        # FAIL IF THE DIRECTORY IS EMPTY. Guards only guard while they exist, and a silently skipped
+        # test suite is indistinguishable from a passing one. That is the failure this step prevents.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(tests/mimir-rules/*.test.yaml)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "::error::no unit tests found under tests/mimir-rules/ - the rule regression guards are gone"
+            exit 1
+          fi
+          echo "Running ${#tests[@]} test file(s): ${tests[*]}"
+          docker run --rm -v "$PWD:/w:ro" -w /w --entrypoint promtool \
+            prom/prometheus:v3.1.0 test rules "${tests[@]}"
+
+      - name: assert every file parses as a Mimir rule-groups doc
+        # promtool validates rule SEMANTICS. This additionally asserts the top-level SHAPE the `local`
+        # ruler backend requires: a `groups:` list, each group named, each with rules. A file that is
+        # valid YAML but the wrong shape loads as an EMPTY namespace, which silently drops alerts
+        # rather than failing loudly. promtool alone does not catch that.
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = []
+          total_groups = total_rules = 0
+          for path in sorted(glob.glob("config/mimir/rules/demo/*.yaml")):
+              doc = yaml.safe_load(open(path))
+              if not isinstance(doc, dict) or "groups" not in doc:
+                  bad.append(f"{path}: missing top-level 'groups:' key")
+                  continue
+              groups = doc["groups"]
+              if not isinstance(groups, list) or not groups:
+                  bad.append(f"{path}: 'groups' must be a non-empty list")
+                  continue
+              for g in groups:
+                  if not g.get("name"):
+                      bad.append(f"{path}: a group is missing 'name'")
+                  rules = g.get("rules") or []
+                  if not rules:
+                      bad.append(f"{path}: group {g.get('name')!r} has no rules")
+                  for r in rules:
+                      if not (r.get("alert") or r.get("record")):
+                          bad.append(f"{path}: group {g.get('name')!r} has a rule with neither 'alert' nor 'record'")
+                  total_groups += 1
+                  total_rules += len(rules)
+          if bad:
+              for b in bad:
+                  print(f"::error::{b}")
+              sys.exit(1)
+          print(f"OK: {total_rules} rules across {total_groups} groups")
+          PY

@@ -1,0 +1,147 @@
+# Grafana datasource provisioning configuration
+
+apiVersion: 1
+
+datasources:
+  # --- Loki Datasource ---
+  - name: Loki
+    type: loki
+    uid: Loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Loki runs multi-tenant (auth_enabled: true), so Grafana must send the tenant
+      # header or every query 401s. The value lives in secureJsonData per Grafana's
+      # custom-header contract. It matches the collector's write tenant and the two
+      # Mimir datasources below.
+      httpHeaderName1: 'X-Scope-OrgID'
+      derivedFields:
+        # Primary: OTLP logs carry the trace context as Loki *structured metadata*,
+        # not as text in the body. Match the `trace_id` label. A body regex alone
+        # finds nothing in an OTLP-produced line, which is every line here.
+        - datasourceUid: tempo
+          matcherType: label
+          matcherRegex: trace_id
+          name: TraceID
+          url: $${__value.raw}
+        # Fallback: legacy lines that embed a literal `traceID=<hex>` token in the body.
+        - datasourceUid: tempo
+          matcherType: regex
+          matcherRegex: traceID=(\w+)
+          name: TraceIDBody
+          url: $${__value.raw}
+    secureJsonData:
+      httpHeaderValue1: 'demo'
+    isDefault: false
+
+  # --- Tempo Datasource ---
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      httpMethod: GET
+      # Force HTTP protocol and disable gRPC auto-detection
+      tracesToLogsV2:                        # modernized from deprecated tracesToLogs
+        datasourceUid: Loki
+        tags:
+          - key: job
+          - key: instance
+          - key: pod
+          - key: namespace
+          - key: service.name
+            value: service_name
+        spanStartTimeShift: '-1h'
+        spanEndTimeShift: '1h'
+        filterByTraceID: true
+        filterBySpanID: false
+      tracesToMetrics:                       # trace -> RED metrics (Mimir connector series)
+        datasourceUid: Mimir-Prometheus
+        spanStartTimeShift: '-1h'
+        spanEndTimeShift: '1h'
+        tags:                                # dotted keys need value: mapping to underscore labels
+          - key: service.name
+            value: service_name
+          - key: span.name
+            value: span_name
+        queries:
+          - name: 'Request rate (RED - Calls)'
+            query: 'sum(rate(traces_span_metrics_calls_total{$$__tags}[5m])) by (service_name, span_name)'
+          - name: 'Error rate (RED - Errors)'
+            query: 'sum(rate(traces_span_metrics_calls_total{$$__tags, status_code="STATUS_CODE_ERROR"}[5m])) by (service_name, span_name)'
+          - name: 'P99 latency (RED - Duration)'
+            query: 'histogram_quantile(0.99, sum(rate(traces_span_metrics_duration_milliseconds_bucket{$$__tags}[5m])) by (le, service_name, span_name))'
+      serviceMap:
+        datasourceUid: Mimir-Prometheus
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+    isDefault: false
+
+  # --- Mimir Datasource (as Prometheus) ---
+  - name: Mimir-Prometheus
+    type: prometheus
+    uid: Mimir-Prometheus
+    access: proxy
+    url: http://mimir:9009/prometheus
+    jsonData:
+      httpMethod: POST
+      httpHeaderName1: 'X-Scope-OrgID'
+      # Surface the Mimir ruler's rules (config/mimir/rules/) under Alerting ->
+      # Alert rules, and tell Grafana which Alertmanager those rules notify
+      # through. Without alertmanagerUid the rules appear unlinked, and the
+      # Alerting UI cannot show their notification path.
+      #
+      # Rules are READ-ONLY here. Grafana offers no setting that keeps rules
+      # visible while it hides the edit controls: manageAlerts:false hides the
+      # rules themselves. So the UI will offer Edit and Delete on these groups,
+      # and Mimir will refuse the write (ruler_storage.backend=local; git is the
+      # deploy path). config/nginx/grafana.conf.template blocks the ruler write
+      # path at the edge, so an attempted edit fails at once and cannot
+      # half-apply.
+      manageAlerts: true
+      alertmanagerUid: mimir-alertmanager
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+    secureJsonData:
+      httpHeaderValue1: 'demo'
+    isDefault: true
+
+  # --- Mimir Alertmanager Datasource ---
+  # Surfaces the Mimir-embedded Alertmanager (firing alerts, silences) inside
+  # Grafana's Alerting UI, so alert state and silence management no longer need
+  # a shell on the box. X-Scope-OrgID must match the tenant the ruler and the
+  # Alertmanager run under ('demo').
+  #
+  # THE URL IS THE BARE ROOT, NOT /alertmanager. With `implementation: mimir`
+  # Grafana appends the /alertmanager prefix itself. A URL that already ends in
+  # /alertmanager therefore double-prefixes every request, and the datasource
+  # silently does nothing. Measured against Mimir 3.1.2:
+  #     url .../alertmanager -> GET /alertmanager/alertmanager/api/v2/alerts = 404
+  #     url .../alertmanager -> GET /alertmanager/api/v1/alerts              = 410
+  #                                 (Alertmanager v1 API, removed in 0.27.0)
+  #     url .../:9009        -> GET /alertmanager/api/v2/alerts              = 200
+  #     url .../:9009        -> GET /api/v1/alerts                           = 200
+  # The 404 is indistinguishable from "no alerts" in the UI, which is why the
+  # wrong URL can go unnoticed for a long time.
+  #
+  # WARNING, read before you enable this. The Alertmanager config endpoint
+  # (POST /api/v1/alerts) overwrites the whole tenant config, and it is reachable
+  # once the URL is correct. A wrong URL closes that path only by accident.
+  # config/nginx/grafana.conf.template blocks non-GET on the Grafana proxy route
+  # for this datasource. That block is a PREREQUISITE of this datasource, not
+  # optional hardening. Do not land one without the other.
+  - name: Mimir-Alertmanager
+    type: alertmanager
+    uid: mimir-alertmanager
+    access: proxy
+    url: http://mimir:9009
+    jsonData:
+      implementation: mimir
+      httpHeaderName1: 'X-Scope-OrgID'
+    secureJsonData:
+      httpHeaderValue1: 'demo'
+    isDefault: false

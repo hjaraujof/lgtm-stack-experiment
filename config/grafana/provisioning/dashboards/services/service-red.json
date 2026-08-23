@@ -1,0 +1,139 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Golden-path RED overview for any instrumented service. Pick a service from the variable; every panel reads the precomputed recording rules (service:*), so it is cheap to render and works for any service the moment it emits spans. New services need ZERO dashboard work - they appear in the dropdown automatically.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "panels": [],
+      "title": "RED — $service",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Request rate (Rate). Recording rule: service:requests:rate5m.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "expr": "service:requests:rate5m{service_name=~\"$service\"}",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Availability error ratio (Errors): fraction of inbound HTTP requests answered 5xx. Recording rule: service:http_5xx_ratio:5m. Exemplars link to a failing trace. A service that emits no http.response.status_code (Next.js apps) has NO series here rather than a 0 - see ServiceAvailabilitySLIUnmeasurable.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit", "max": 1, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] } }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "service:http_5xx_ratio:5m{service_name=~\"$service\"}",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "5xx ratio (5m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Latency quantiles (Duration). Recording rules: service:latency_p50/p95/p99_ms:5m. Exemplars link to a slow trace.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "ms" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "service:latency_p50_ms:5m{service_name=~\"$service\"}",
+          "legendFormat": "p50 {{service_name}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "service:latency_p95_ms:5m{service_name=~\"$service\"}",
+          "legendFormat": "p95 {{service_name}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "service:latency_p99_ms:5m{service_name=~\"$service\"}",
+          "legendFormat": "p99 {{service_name}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Latency p50 / p95 / p99",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["red", "golden-path", "template"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+        "definition": "label_values(service:requests:rate5m, service_name)",
+        "includeAll": true,
+        "multi": true,
+        "name": "service",
+        "options": [],
+        "query": { "query": "label_values(service:requests:rate5m, service_name)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Service RED (golden path)",
+  "uid": "service-red-golden",
+  "version": 1,
+  "weekStart": ""
+}

@@ -1,0 +1,79 @@
+# promtool unit tests for ApplicationMetricsAbsent.
+#
+# WHY THIS SUITE EXISTS. The rule once fired as a FALSE POSITIVE while a hundred healthy series from
+# ten services were flowing. Its selector named only the LEGACY OTel family
+# (http_server_duration_milliseconds_count) while the fleet had moved to the modern semconv name
+# (http_server_request_duration_seconds_count). The two coexisted for a while, the last service on
+# the legacy name was upgraded, the legacy selector went empty, and absent() announced "no
+# application metrics" about a fleet that was emitting normally.
+#
+# THE LESSON: an absent() rule scoped to one metric name is really tracking "is the last emitter of
+# that name still deployed". Case 1 below is the regression guard, and it FAILS against a
+# single-generation selector.
+#
+# Run:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w:ro" prom/prometheus:v3.1.0 \
+#     test rules /w/tests/mimir-rules/application-metrics-absent.test.yaml
+
+rule_files:
+    - ../../config/mimir/rules/demo/stack-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+    # THE REGRESSION GUARD. Modern semconv only. Must stay quiet.
+    - interval: 1m
+      input_series:
+          - series: 'http_server_request_duration_seconds_count{service_name="tenant-a/dev/web-app"}'
+            values: '0+10x40'
+          - series: 'http_client_request_duration_seconds_count{service_name="tenant-a/dev/support-api"}'
+            values: '0+5x40'
+      alert_rule_test:
+          - eval_time: 30m
+            alertname: ApplicationMetricsAbsent
+            exp_alerts: []
+
+    # Legacy semconv only. A service still on old instrumentation IS emitting, so metrics are not
+    # absent and this must stay quiet too. The fix must WIDEN the selector, not swap one name for
+    # the other.
+    - interval: 1m
+      input_series:
+          - series: 'http_server_duration_milliseconds_count{service_name="tenant-a/dev/org-api"}'
+            values: '0+10x40'
+      alert_rule_test:
+          - eval_time: 30m
+            alertname: ApplicationMetricsAbsent
+            exp_alerts: []
+
+    # Both families present during a fleet migration - the normal transitional state. Quiet.
+    - interval: 1m
+      input_series:
+          - series: 'http_server_request_duration_seconds_count{service_name="tenant-a/dev/web-app"}'
+            values: '0+10x40'
+          - series: 'http_server_duration_milliseconds_count{service_name="tenant-a/dev/org-api"}'
+            values: '0+10x40'
+      alert_rule_test:
+          - eval_time: 30m
+            alertname: ApplicationMetricsAbsent
+            exp_alerts: []
+
+    # THE CONDITION THE RULE EXISTS FOR: collector-derived series still flowing, but NO
+    # application-emitted http_* family at all. The stack LOOKS alive because
+    # traces_span_metrics_* is present, while per-service RED from the apps themselves is gone.
+    # MUST fire.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/dev/web-app"}'
+            values: '0+100x40'
+      alert_rule_test:
+          - eval_time: 10m
+            alertname: ApplicationMetricsAbsent
+            exp_alerts: [] # for: 15m - not yet
+          - eval_time: 30m
+            alertname: ApplicationMetricsAbsent
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                  exp_annotations:
+                      summary: 'No application-emitted metrics in Mimir for 15m (http_server/http_client duration families empty). Everything left is collector-derived, so per-service RED from the apps themselves is gone. Check: (1) does the deployed instrumentation package export metrics at all, (2) does the task definition still carry the OTLP metrics endpoint variable, (3) is the collector metrics pipeline exporting.'
+                      runbook_url: 'docs/runbooks/pipeline-silent.md'

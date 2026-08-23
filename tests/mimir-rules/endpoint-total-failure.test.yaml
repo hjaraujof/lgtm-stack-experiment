@@ -1,0 +1,107 @@
+# promtool unit tests for EndpointTotallyFailing.
+#
+# MUST NOT live under config/mimir/rules/. That tree is the ruler's rule source
+# (ruler_storage.backend=local, mounted :ro in docker-compose and polled every poll_interval), so any
+# .yaml added there is loaded AS RULES. A test file beside real rules is picked up by the ruler's
+# directory scan.
+#
+# Run:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w:ro" prom/prometheus:v3.1.0 \
+#     test rules /w/tests/mimir-rules/endpoint-total-failure.test.yaml
+
+rule_files:
+    - ../../config/mimir/rules/demo/red-recording.yaml
+    - ../../config/mimir/rules/demo/stack-alerts.yaml
+
+evaluation_interval: 30s
+
+tests:
+    # THE SHAPE THIS ALERT EXISTS FOR. A deploy drops one required environment variable, so the token
+    # endpoint fails every request. The rest of the service is untouched, and a static liveness health
+    # check answers 200 throughout.
+    #   token:  +3 err / 30s, zero successes  -> 0.1 req/s, 100% failure
+    #   actors: +120 ok / 30s                 -> 4.0 req/s, 0% failure
+    #   service-wide ratio = 0.1/4.1 = 2.4%   -> UNDER HighServiceErrorRatio's 5% bar
+    - interval: 30s
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_name="POST /api/auth/token",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}'
+            values: '0+3x60'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_name="GET /api/actors",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_UNSET"}'
+            values: '0+120x60'
+      alert_rule_test:
+          - eval_time: 25m
+            alertname: EndpointTotallyFailing
+            exp_alerts:
+                - exp_labels:
+                      severity: critical
+                      service_name: tenant-a/prod/auth-api
+                      span_name: POST /api/auth/token
+                  exp_annotations:
+                      summary: 'PROD/UAT tenant-a/prod/auth-api endpoint POST /api/auth/token has failed 100% of requests for 15m (>5 req/5m, zero successes)'
+                      runbook_url: 'docs/runbooks/endpoint-total-failure.md'
+          # The reason this alert had to be added at all. If the service-wide alert ever starts to
+          # catch this case, the two have become redundant, and this expectation fails and says so.
+          - eval_time: 25m
+            alertname: HighServiceErrorRatio
+            exp_alerts: []
+
+    # A PARTIALLY failing endpoint must NOT fire: it has successes, so `unless` removes it. This
+    # covers the documented limitation rather than leaving it to inspection.
+    #   +30 err / 30s and +30 ok / 30s -> 50% failure
+    - interval: 30s
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_name="POST /api/auth/token",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}'
+            values: '0+30x60'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_name="POST /api/auth/token",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_UNSET"}'
+            values: '0+30x60'
+      alert_rule_test:
+          - eval_time: 25m
+            alertname: EndpointTotallyFailing
+            exp_alerts: []
+
+    # BENIGN-ERROR IMMUNITY. A caught-and-handled recurring error is interleaved with successes, so
+    # an endpoint carrying it is excluded by construction - even at a 90% error rate. This is the
+    # property that makes the alert trustworthy where every ratio alert in this stack carries a
+    # benign floor it cannot subtract.
+    - interval: 30s
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/prod/orders-api",span_name="POST /documents",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}'
+            values: '0+45x60'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/prod/orders-api",span_name="POST /documents",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_UNSET"}'
+            values: '0+5x60'
+      alert_rule_test:
+          - eval_time: 25m
+            alertname: EndpointTotallyFailing
+            exp_alerts: []
+
+    # Traffic floor: a totally-failing but barely-used endpoint is suppressed.
+    # 0.4 per 30s is about 4 per 5m, under the >5-per-5m floor.
+    - interval: 30s
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_name="POST /api/internal/rare",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}'
+            values: '0+0.4x60'
+      alert_rule_test:
+          - eval_time: 25m
+            alertname: EndpointTotallyFailing
+            exp_alerts: []
+
+    # Env scoping: qa is expected-noisy and excluded from live paging, so an identically-broken qa
+    # endpoint must stay silent.
+    - interval: 30s
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/qa/auth-api",span_name="POST /api/auth/token",span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}'
+            values: '0+3x60'
+      alert_rule_test:
+          - eval_time: 25m
+            alertname: EndpointTotallyFailing
+            exp_alerts: []
+
+    # CLIENT spans are not request handlers; only SPAN_KIND_SERVER is an endpoint.
+    - interval: 30s
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/prod/auth-api",span_name="GET",span_kind="SPAN_KIND_CLIENT",status_code="STATUS_CODE_ERROR"}'
+            values: '0+3x60'
+      alert_rule_test:
+          - eval_time: 25m
+            alertname: EndpointTotallyFailing
+            exp_alerts: []
