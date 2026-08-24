@@ -1,0 +1,64 @@
+# kind overlay.
+#
+#   helm install lgtm k8s/charts/lgtm-stack -n lgtm --create-namespace \
+#     -f k8s/charts/lgtm-stack/values-kind.yaml
+#
+# Only the differences from values.yaml are stated here. A file that repeats the defaults
+# stops being an overlay and becomes a second copy that drifts.
+
+# SMALL ENOUGH TO FIT A LAPTOP. The defaults describe a real deployment: Mimir asks for 2Gi
+# and the collector may take 6Gi. Three kind nodes are three containers on one machine, so
+# the requests below are cut to what will actually schedule. The LIMITS still matter and
+# are kept meaningful - the collector's memory_limiter resolves its percentage against the
+# limit, so removing it would silently disable the processor.
+loki:
+  persistence:
+    size: 5Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 1Gi }
+
+tempo:
+  persistence:
+    size: 5Gi
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { memory: 2Gi }
+
+mimir:
+  persistence:
+    size: 5Gi
+  resources:
+    requests: { cpu: 200m, memory: 1Gi }
+    limits: { memory: 3Gi }
+
+grafana:
+  persistence:
+    size: 2Gi
+
+collector:
+  queue:
+    size: 2Gi
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits: { memory: 2Gi }
+  env:
+    # Kept below the 2Gi limit above, with room for non-heap memory.
+    GOMEMLIMIT: 1500MiB
+    GOGC: "400"
+
+minio:
+  persistence:
+    size: 5Gi
+
+ingress:
+  # localtest.me resolves to 127.0.0.1 from any public DNS resolver, so no /etc/hosts entry
+  # is needed and the kind port mapping does the rest.
+  host: grafana.localtest.me
+  tls:
+    enabled: true
+    clusterIssuer: selfsigned
+    # Let's Encrypt cannot issue for this name: the HTTP-01 challenge needs the ACME server
+    # to reach the host from the internet. Self-signed is the only honest option locally,
+    # and the browser warning is the price.
+    createIssuer: true

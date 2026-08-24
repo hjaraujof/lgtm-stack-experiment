@@ -1,0 +1,791 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Health of the LGTM stack itself, built ENTIRELY from series already scraped by the collector's prometheus/internal jobs (Tempo + Mimir + collector /metrics, filtered to the incident-relevant families). These same series drive the stack-alerts.yaml rules; this dashboard makes them visible DURING an incident instead of alert-only. Zero new ingest. READ THE ROWS TOP TO BOTTOM AS ONE PATH: producer -> collector receiver -> collector exporter -> backend. The 'Collector ingest' row covers the first two hops; the 'Silent-failure signals' row covers the backend hop. A drop is only ruled out when both read clean, because refused==0 says nothing about a backend that accepts a write and then discards it.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 100,
+      "panels": [],
+      "title": "Pipeline liveness",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Span-metrics call rate from the collector connectors. 0 for 10m fires SpanMetricsPipelineSilent (traces pipeline down).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.001
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(traces_span_metrics_calls_total[5m]))",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Span-metrics rate (pipeline alive)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Mimir active in-memory series. Warns at 400k (80% of the 500k cap) via MimirActiveSeriesHigh.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 400000
+              },
+              {
+                "color": "red",
+                "value": 500000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(cortex_ingester_memory_series)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mimir active series",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Tempo 3.0 live-store live traces (tempo_live_store_live_traces, replaces the removed local_blocks gauge). Cap is max_traces_per_user=25000; approaching it drives tempo_discarded_spans_total{reason=live_traces_exceeded} = TempoLiveTracesExceeded (the disk-full precursor).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 15000
+              },
+              {
+                "color": "red",
+                "value": 22000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(tempo_live_store_live_traces)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tempo live traces (cap 25k)",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "id": 101,
+      "panels": [],
+      "title": "Silent-failure signals (the incident class)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Tempo spans discarded for live_traces_exceeded. Any nonzero = TempoLiveTracesExceeded.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(tempo_discarded_spans_total[5m])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tempo discarded spans (by reason)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Mimir discarded samples. Any nonzero = MimirSamplesDiscarded (RED fidelity loss).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(cortex_discarded_samples_total[5m]))",
+          "legendFormat": "discarded",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mimir discarded samples",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Tempo compaction backlog. >50 for 15m = TempoCompactionStalled (S3 compactor stall).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 50
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            },
+            "axisSoftMax": 50
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(tempodb_compaction_outstanding_blocks)",
+          "legendFormat": "outstanding blocks",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tempo compaction backlog",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Mimir S3 block upload + compaction failures. Any nonzero = MimirBlockUploadOrCompactionFailing (silent data-loss risk).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(cortex_ingester_shipper_upload_failures_total[15m]))",
+          "legendFormat": "shipper upload failures",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(cortex_compactor_runs_failed_total[15m]))",
+          "legendFormat": "compactor run failures",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Mimir S3 upload / compaction failures",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "id": 102,
+      "panels": [],
+      "title": "Collector ingest (accept : refuse)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Span ingest volume at the collector's OTLP receiver, with the refused counter on the same axis for scale. This is the DENOMINATOR that makes a flat 0 refused readable: without it, 0 refused looks identical whether the collector is healthy or receiving nothing at all. A drop to 0 accepted with 0 refused means the producers stopped, not that ingest is clean.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_accepted_spans_total[5m]))",
+          "legendFormat": "accepted",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_refused_spans_total[5m]))",
+          "legendFormat": "refused",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Span ingest volume (accepted vs refused)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Metric-point and log-record ingest volume, split BY RECEIVER on purpose. The self-scrape receiver (prometheus/internal) and hostmetrics together dominate the metric-point total, so a single sum() hides the application plane. Only the otlp series is application metrics. If your deployment gates application metrics to a subset of environments, a low otlp figure is expected there, not a defect. Likewise, if your applications ship logs to a platform log service rather than through this collector, a thin log-record line is expected.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_accepted_metric_points_total[5m])) by (receiver)",
+          "legendFormat": "accepted {{receiver}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_refused_metric_points_total[5m])) by (receiver)",
+          "legendFormat": "refused {{receiver}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_accepted_log_records_total[5m])) by (receiver)",
+          "legendFormat": "logs accepted {{receiver}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_refused_log_records_total[5m])) by (receiver)",
+          "legendFormat": "logs refused {{receiver}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Metric-point and log-record ingest volume (by receiver)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Receiver drop ratio: refused / (accepted + refused). 0 is healthy, and a HEALTHY 0 MUST STILL BE VISIBLE - that is the whole point of this panel. The dashed lines are the 0.1% and 1% thresholds; thresholdsStyle is set explicitly because this panel colours by palette-classic (three series need three colours) and under that colour mode a threshold step paints nothing. axisSoftMin is NEGATIVE on purpose: with min:0 a series sitting at exactly 0 draws on the axis floor, is clipped, and the panel reads as EMPTY - which defeats clamp_min, since the reader still cannot tell healthy-zero from no-data. A hair of headroom below zero floats the line clear of the axis. axisSoftMax keeps the 1% limit on screen; both are SOFT, so a real excursion still rescales the axis. The clamp_min(.., 1) prevents 0/0 while ingest is quiet. LIMIT OF THIS PANEL: it covers the RECEIVER hop only. A downstream rejection (Tempo trace_too_large, Mimir duplicate-timestamp) never touches these counters and reads perfectly healthy here - see the two discard panels in the row above.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percentunit",
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            },
+            "axisSoftMin": -0.0015,
+            "axisSoftMax": 0.01,
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.001
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_refused_spans_total[5m])) / clamp_min(sum(rate(otelcol_receiver_accepted_spans_total[5m])) + sum(rate(otelcol_receiver_refused_spans_total[5m])), 1)",
+          "legendFormat": "spans",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_refused_metric_points_total[5m])) / clamp_min(sum(rate(otelcol_receiver_accepted_metric_points_total[5m])) + sum(rate(otelcol_receiver_refused_metric_points_total[5m])), 1)",
+          "legendFormat": "metric points",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_receiver_refused_log_records_total[5m])) / clamp_min(sum(rate(otelcol_receiver_accepted_log_records_total[5m])) + sum(rate(otelcol_receiver_refused_log_records_total[5m])), 1)",
+          "legendFormat": "log records",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Receiver drop ratio (0 = healthy)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "The EXPORTER hop, which the receiver drop ratio cannot see. A span can be accepted by the receiver and still never reach Tempo. Any nonzero series here is loss between the collector and a backend, per exporter. Still not the whole path: a backend that accepts the write and then discards the data (Tempo trace_too_large) counts as a SUCCESS here. Logs have a receiver denominator too, so a log-record send failure can be read as a fraction of log ingest rather than as a bare count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_exporter_send_failed_spans_total[5m])) by (exporter)",
+          "legendFormat": "spans {{exporter}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_exporter_send_failed_metric_points_total[5m])) by (exporter)",
+          "legendFormat": "metric points {{exporter}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_exporter_send_failed_log_records_total[5m])) by (exporter)",
+          "legendFormat": "log records {{exporter}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Exporter send failures (the hop after the receiver)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "lgtm",
+    "stack-health",
+    "ops"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "LGTM Stack Health",
+  "uid": "lgtm-stack-health",
+  "version": 1,
+  "weekStart": ""
+}

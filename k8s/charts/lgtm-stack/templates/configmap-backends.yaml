@@ -1,0 +1,85 @@
+{{/*
+The three backend configs, one ConfigMap each.
+
+ONE PER BACKEND, NOT ONE FOR ALL THREE. Every workload template annotates its pods with a
+checksum of its own ConfigMap, so a change to the Mimir config must roll only Mimir. A
+single shared ConfigMap would roll all three on every edit, and a rolling restart of a
+telemetry backend is not free.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "loki") | nindent 4 }}
+data:
+  config.yaml: |
+    {{- include "lgtm.renderConfig" (dict "ctx" $ "file" "files/loki-config.yaml" "override" .Values.loki.configOverride) | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "tempo") | nindent 4 }}
+data:
+  config.yaml: |
+    {{- include "lgtm.renderConfig" (dict "ctx" $ "file" "files/tempo-config.yaml" "override" .Values.tempo.configOverride) | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-config
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 4 }}
+data:
+  config.yaml: |
+    {{- include "lgtm.renderConfig" (dict "ctx" $ "file" "files/mimir-config.yaml" "override" .Values.mimir.configOverride) | nindent 4 }}
+---
+{{/*
+THE RULER'S ONLY RULE SOURCE.
+
+config/mimir-config.yaml sets ruler_storage.backend=local, which scans
+<directory>/<tenant>/<namespace> for plain Prometheus YAML. So this ConfigMap mounts at
+/etc/mimir/rules/demo and each key becomes one namespace, exactly as the bind mount does
+in Compose.
+
+WHAT CHANGES BETWEEN THE TWO PLANES. In Compose, `git pull` is the deploy: the ruler
+re-scans the bind mount every poll_interval. Here, `helm upgrade` is the deploy. A
+ConfigMap update reaches the pod's mounted volume within about a minute without a restart,
+and the ruler then re-scans on its own poll_interval. No restart is needed, and the pod
+therefore carries NO checksum annotation for this ConfigMap - that omission is deliberate.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-rules-demo
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 4 }}
+data:
+  {{- $rules := .Files.Glob "files/mimir/rules/demo/*.yaml" }}
+  {{- if not $rules }}
+  {{- fail "no Mimir rule files found in the chart. Run `make -C k8s sync-config`." }}
+  {{- end }}
+  {{- ($rules.AsConfig) | nindent 2 }}
+---
+{{/*
+The Alertmanager tenant config, read by the reconciler Deployment and pushed through
+Mimir's config API. It is NOT mounted into Mimir. The reason is in the Mimir config: the
+Alertmanager keeps its own silences and notification log on object storage, and a
+read-only mount would lose both.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-alertmanager-config
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 4 }}
+data:
+  demo-am.yaml: |
+    {{- .Files.Get "files/mimir/alertmanager/demo-am.yaml" | nindent 4 }}

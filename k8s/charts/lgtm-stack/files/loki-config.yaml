@@ -1,0 +1,170 @@
+# Loki configuration optimized for local Docker Compose & Grafana Explore
+# Includes volume limits and structured metadata support
+
+# Multi-tenant, so Loki honours X-Scope-OrgID and routes to the tenant `demo`.
+# That matches the collector's otlphttp/loki header and both Mimir datasources.
+#
+# DO NOT set this to false. With auth off, Loki ignores every tenant header and
+# forces all ingest onto the hardcoded `fake` tenant. On 3.7.3 that tenant fails
+# to flush (`mkdir fake: permission denied`), so logs are lost and the
+# LokiTenantFakeIngest alert fires. See docs/runbooks/loki-discards.md.
+#
+# Every Loki DATA-PATH client must therefore send X-Scope-OrgID: the collector
+# exporter does, and the Grafana Loki datasource does through httpHeaderName1.
+# Admin endpoints (/ready, /metrics) stay tenant-free.
+auth_enabled: true
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  # log_level: debug # Uncomment for verbose logging if needed
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /tmp/loki
+  storage:
+    filesystem: # Using filesystem for local storage simplicity
+      chunks_directory: /tmp/loki/chunks
+      rules_directory: /tmp/loki/rules
+  replication_factor: 1 # Required for standalone mode
+  ring:
+    kvstore:
+      store: inmemory # Suitable for single-instance local setup
+
+# SCHEMA PERIODS. Read this before you change `store`, `object_store`, `schema` or `index.prefix`.
+#
+# LOKI DOES NOT MIGRATE EXISTING DATA ACROSS A SCHEMA OR STORE CHANGE. Editing the period below in
+# place makes older data unreadable. The supported move is to ADD A NEW PERIOD with a `from:` date at
+# a FUTURE day boundary, and leave the old one in place so pre-cutover data still resolves.
+#
+# A SECOND, LESS OBVIOUS USE: a distinct `index.prefix` on a new period is a ROLLBACK-SAFETY BOUNDARY
+# for a major Loki version bump. A new binary may write tsdb index files the old binary cannot read,
+# so without a boundary the upgrade is one-way. With one, the new version writes into its own object
+# namespace, and a rollback still reads everything before the boundary under the old prefix.
+#
+# If you use either pattern, the `from:` date is a DEPLOY REQUIREMENT, not a comment: bring the new
+# version up ON OR AFTER that date, or it writes into the previous period and the isolation is lost.
+schema_config:
+  configs:
+    - from: 2024-01-01 # Use a recent date for schema versioning
+      store: tsdb # TSDB is recommended for Loki 3.0+
+      object_store: filesystem # Store index files on the filesystem
+      schema: v13 # v13 supports structured metadata
+      index:
+        prefix: index_
+        period: 24h # Index period (daily buckets)
+    # Example of the object-store cutover described above. Uncomment, set a FORWARD `from:` date,
+    # point storage_config.aws at your bucket, and switch compactor.delete_request_store to s3.
+    # - from: 2026-01-01
+    #   store: tsdb
+    #   object_store: s3
+    #   schema: v13
+    #   index:
+    #     prefix: index_
+    #     period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /tmp/loki/tsdb-shipper-active
+    cache_location: /tmp/loki/tsdb-shipper-cache
+    cache_ttl: 24h
+  filesystem: # Define the backend for the object store
+    directory: /tmp/loki/chunks
+
+compactor:
+  working_directory: /tmp/loki/compactor
+  # shared_store: filesystem # Invalid here
+  compaction_interval: 10m # Compact chunks frequently for better query performance
+  retention_enabled: true # Enable time and/or volume-based retention
+  delete_request_store: filesystem # Required when retention_enabled is true
+  # volume_enabled: true # Invalid here, belongs under limits_config
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 1
+
+# --- Ingester Configuration ---
+ingester:
+  lifecycler:
+    # Manages ingester registration in the ring
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+  # chunk_idle_period: 5m # How long to wait before flushing an idle chunk
+  # max_chunk_age: 1h    # Max age before a chunk is flushed
+  # chunk_target_size: 1048576 # 1MB target chunk size
+  # max_transfer_retries: 3
+  # structured_metadata: # Invalid block here. Use limits_config.allow_structured_metadata
+  #   enabled: true
+
+# --- Settings relevant for Grafana Explore performance ---
+# frontend_worker: # Invalid block for recent Loki versions in monolithic mode
+#   frontend_address: 127.0.0.1:9095
+#   parallelism: 4
+
+query_range:
+  align_queries_with_step: true
+  # max_query_length: 0 # Invalid key here
+  cache_results: true
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+querier:
+  max_concurrent: 8
+
+# --- Limits Configuration ---
+limits_config:
+  # enforce_metric_name: false # Invalid key here
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h # 7 days
+  retention_period: 168h # 7 days - auto-delete logs older than this
+  # Volume limit: Max number of active streams allowed globally
+  max_global_streams_per_user: 5000 # Adjust as needed for local testing
+  max_query_series: 500 # Limit series returned by a query
+  ingestion_rate_mb: 15
+  ingestion_burst_size_mb: 20
+  max_label_name_length: 1024
+  max_label_value_length: 2048
+  max_label_names_per_series: 30
+  allow_structured_metadata: true # Required for OTLP log ingestion (Loki 3.0+)
+  volume_enabled: true
+  # Raised from Loki's 64KB default.
+  #
+  # WHY THIS IS EASY TO MISS FOR WEEKS. OTLP log ATTRIBUTES land here as structured metadata. A
+  # service emitting entries above the cap has every one of those entries REJECTED — permanently
+  # lost — while the rest of its logs ingest normally.
+  #
+  # LOKI VALIDATES PER ENTRY: it discards the oversized ones, ingests the remainder of the push, and
+  # still answers HTTP 400. That partial success is what hides it. The service keeps logging, its
+  # log volume looks normal, and only its biggest entries vanish. The loss concentrates in enormous
+  # entries, so it can be a large share of all BYTES received while being a negligible share of
+  # LINES — which means any line-count view of log health misses it entirely.
+  #
+  # Two things to know before you trust a number during triage. The collector's whole-batch
+  # `dropped_items` accounting OVERSTATES the loss badly, because the exporter counts the entire
+  # batch when Loki answers 400 even though Loki ingested the valid remainder. Trust
+  # `loki_discarded_samples_total` for the true figure. That counter is relayed into Mimir by the
+  # loki-internal scrape job, and LokiSamplesDiscarded alerts on it.
+  #
+  # 256KB IS A TOURNIQUET, NOT AN ENDORSEMENT. A service emitting more than ~100KB of structured
+  # metadata per log line is an application defect, and the storage cost is real. Ticket the emitter;
+  # do not keep raising this number. See docs/runbooks/loki-discards.md.
+  max_structured_metadata_size: 256KB
+
+# --- Ruler (Alerting) ---
+ruler:
+  alertmanager_url: ''
+  ring:
+    kvstore:
+      store: inmemory
+  rule_path: /tmp/loki/rules-temp
+  storage:
+    type: local
+    local:
+      directory: /tmp/loki/rules
+  enable_api: true
+
+  # pattern_ingester: # Invalid block here
+  #   enabled: true

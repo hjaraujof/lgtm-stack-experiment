@@ -1,0 +1,131 @@
+{{/*
+The OTLP gateway.
+
+A STATEFULSET FOR A THING THAT LOOKS STATELESS. The collector holds a disk-backed sending
+queue (the file_storage extension) so a restart or a backend outage does not drop what is
+in flight. A queue is state. A Deployment with a PersistentVolumeClaim would make every
+replica share one queue directory, which is corruption rather than sharing.
+
+ONE REPLICA, AND THE REASON IS TAIL SAMPLING. The tail_sampling processor buffers every
+span of a trace until it can decide whether to keep it. Two replicas behind one Service
+receive a trace's spans split between them, and each then samples a fragment. The fix is
+not more replicas: it is a loadbalancing exporter in front, keyed on trace ID, with these
+pods behind it. Until that exists, this stays at one and says so.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-collector") | nindent 4 }}
+  {{- with .Values.otlpService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.otlpService.type }}
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: health
+      port: 13133
+      targetPort: health
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-collector") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: otel-collector
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-collector") | nindent 4 }}
+spec:
+  serviceName: otel-collector
+  replicas: {{ .Values.collector.replicas }}
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-collector") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-collector.yaml") . | sha256sum }}
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-collector") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "lgtm.serviceAccountName" . }}
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Replaces the init-otelcol-queue busybox chown service in docker-compose.yml.
+        fsGroup: 10001
+      containers:
+        - name: collector
+          image: {{ .Values.images.collector }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["--config=/etc/otelcol-contrib/config.yaml"]
+          env:
+            # THESE MOVE WITH resources.limits.memory, NOT INDEPENDENTLY.
+            #   GOGC       paces the garbage collector.
+            #   GOMEMLIMIT is a backstop. Above the heap the process ever reaches, it is
+            #              inert, and GOGC alone paces collection.
+            #   the limit   must hold the GOMEMLIMIT target without an OOM kill.
+            # The memory_limiter processor's limit_percentage resolves against the cgroup
+            # limit here, exactly as it resolves against mem_limit in Compose. Without a
+            # limit set, it would resolve against the whole NODE and never trigger.
+            {{- range $k, $v := .Values.collector.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+            # pprof and zpages are NOT in the Service. In Compose they are published to
+            # 127.0.0.1 only, because they expose internal state and are unauthenticated.
+            # The Kubernetes equivalent of that restriction is to leave them off the
+            # Service and reach them with `kubectl port-forward` when needed.
+            - name: pprof
+              containerPort: 1777
+            - name: zpages
+              containerPort: 55679
+          readinessProbe:
+            httpGet: { path: /, port: health }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: health }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib
+            - name: queue
+              mountPath: /var/lib/otelcol
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+  volumeClaimTemplates:
+    - metadata:
+        name: queue
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.collector.queue.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.collector.queue.size }}

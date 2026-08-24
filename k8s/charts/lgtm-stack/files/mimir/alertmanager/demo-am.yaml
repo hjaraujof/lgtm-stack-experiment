@@ -1,0 +1,125 @@
+# Mimir Alertmanager tenant config.
+#
+# THIS FILE IS THE DEPLOY. scripts/init-mimir-alertmanager.sh reconciles it into Mimir's config API
+# every RECONCILE_INTERVAL_SECS, so a `git pull` deploys it and an out-of-band write is reverted
+# within one interval. alertmanager_storage stays on object storage so the Alertmanager keeps
+# persisting its own state - silences and the notification log - which a read-only local backend
+# would not.
+#
+# Replace 123456789012 with your AWS account id before you deploy.
+
+route:
+  receiver: sns-warning            # default catch-all (unlabeled / warning)
+  group_by: [alertname, service_name]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h             # warnings repeat slowly
+  routes:
+    # Watchdog FIRST, so a later match can never swallow it.
+    #
+    # This is the heartbeat half of the out-of-band delivery detector. The Watchdog rule in
+    # stack-alerts.yaml fires permanently, so a healthy Alertmanager publishes to the watchdog topic
+    # at least every repeat_interval. A CloudWatch alarm in alerting.tf fires when that topic goes
+    # quiet for 3h, and it reaches humans over a path that does NOT traverse this Alertmanager.
+    #
+    # THAT IS THE ENTIRE POINT. If the tenant config is ever replaced with an empty one, every alert
+    # is swallowed in silence, and the only detector of a broken alert path must not itself be the
+    # alert path.
+    #
+    # The watchdog topic is DEDICATED and has no human subscription, so this heartbeat generates zero
+    # notification noise. It exists only to be counted.
+    #
+    # IF YOU RAISE repeat_interval HERE, raise the AM-side lookback in the AlertDeliverySilent rule
+    # with it. A silence detector's window must be wider than the cadence of the traffic it watches.
+    - matchers: [alertname="Watchdog"]
+      receiver: sns-watchdog
+      group_wait: 0s
+      group_interval: 5m
+      repeat_interval: 30m
+    # Critical alerts page harder (short repeat) through a distinct receiver, so an SNS subscription
+    # filter policy can later fan critical to an urgent channel or a paging provider without another
+    # Alertmanager change.
+    - matchers: [severity="critical"]
+      receiver: sns-critical
+      group_wait: 10s
+      repeat_interval: 1h
+
+# INHIBITION. While the traces pipeline is down, or one service is silent, suppress the noisy
+# downstream error, latency and burn alerts derived from it. They are consequences, not independent
+# signals.
+#
+# THE TRAP TO AVOID, and it is easy to fall into: a first attempt at this used
+# `target_matchers: [severity=~"warning|critical"]` with `equal: []`, which suppressed EVERY firing
+# alert stack-wide. That included the independent Tempo, Mimir, collector and Loki infra alerts -
+# object-store upload failures, compaction failures, disk-full tripwires - which are NOT consequences
+# of a silent traces pipeline. A concurrent data-loss condition would have been hidden by the very
+# rule meant to reduce noise. The target list is therefore an explicit ALLOWLIST of the
+# span-metrics-DERIVED alerts, and everything else stays free to fire.
+#
+# ServiceAvailabilitySLIUnmeasurable belongs in both lists, and for a sharper reason than the others:
+# its whole condition is "SERVER spans exist but none carry a status code", which a silent pipeline
+# satisfies VACUOUSLY for every service at once. To omit it turns one pipeline outage into a
+# fleet-wide page storm.
+#
+# `equal: []` on the first rule is retained because the pipeline-silent alerts are unscoped
+# aggregates with no service_name label to key on. Routing needs no change for any of this: the
+# route tree keys on severity, not on alertname.
+inhibit_rules:
+  - source_matchers: [alertname=~"SpanMetricsPipelineSilent|ProdSpanMetricsPipelineSilent"]
+    target_matchers: [alertname=~"ServiceErrorBudget.*|ServiceLatencySLIBreach|HighServiceErrorRatio|ServiceAuthFailureRateHigh|ServiceAvailabilitySLIUnmeasurable"]
+    equal: []                      # source is pipeline-wide (no service_name); suppress only the span-metric-derived RED alerts
+  - source_matchers: [alertname="ServiceTelemetrySilent"]
+    target_matchers: [alertname=~"ServiceErrorBudget.*|ServiceLatencySLIBreach|HighServiceErrorRatio|ServiceAuthFailureRateHigh|ServiceAvailabilitySLIUnmeasurable"]
+    equal: [service_name]          # per-service: a silent service cannot also be "erroring"
+
+receivers:
+  # The two receivers below publish to the SAME topic today, differentiated by a severity message
+  # attribute, so a downstream SNS subscription filter policy can route without another Alertmanager
+  # change. Subject and message include the runbook link for responder self-service.
+  #
+  # EVERY TEMPLATE MUST RENDER .Status, AND MUST SPLIT .Alerts.Firing FROM .Alerts.Resolved.
+  #
+  # `send_resolved` defaults to TRUE in Alertmanager, and it is deliberately left on: knowing a
+  # critical cleared is worth a message. That means each alert notifies twice per lifecycle, once
+  # firing and once resolved. A template that renders neither .Status nor the two groups, and uses a
+  # bare `{{ range .Alerts }}` over a static `summary` annotation, produces a resolve that is
+  # character-for-character identical to the fire. Both then read as a DUPLICATE ALERT, and the team
+  # concludes the alert is flapping when nothing is flapping.
+  #
+  # If you are chasing apparent duplicate messages, check this template BEFORE you blame a rule.
+  # A pending alert is never sent to the Alertmanager - only firing and resolved are - so an alert
+  # that merely goes pending repeatedly cannot be the source of message volume.
+  - name: sns-critical
+    sns_configs:
+      - topic_arn: arn:aws:sns:us-east-1:123456789012:lgtm-stack-alerts
+        sigv4:
+          region: us-east-1
+        subject: '[{{ .Status | toUpper }}] LGTM critical: {{ .CommonLabels.alertname }}'
+        message: '{{ if .Alerts.Firing }}FIRING ({{ len .Alerts.Firing }}):{{ "\n" }}{{ range .Alerts.Firing }}{{ .Annotations.summary }} (severity={{ .Labels.severity }}){{ if .Annotations.runbook_url }}{{ "\n" }}runbook: {{ .Annotations.runbook_url }}{{ end }}{{ "\n" }}{{ end }}{{ end }}{{ if .Alerts.Resolved }}RESOLVED ({{ len .Alerts.Resolved }}):{{ "\n" }}{{ range .Alerts.Resolved }}{{ .Annotations.summary }}{{ "\n" }}{{ end }}{{ end }}'
+        attributes:
+          severity: critical
+  - name: sns-warning
+    sns_configs:
+      - topic_arn: arn:aws:sns:us-east-1:123456789012:lgtm-stack-alerts
+        sigv4:
+          region: us-east-1
+        subject: '[{{ .Status | toUpper }}] LGTM: {{ .CommonLabels.alertname }}'
+        message: '{{ if .Alerts.Firing }}FIRING ({{ len .Alerts.Firing }}):{{ "\n" }}{{ range .Alerts.Firing }}{{ .Annotations.summary }} (severity={{ .Labels.severity }}){{ if .Annotations.runbook_url }}{{ "\n" }}runbook: {{ .Annotations.runbook_url }}{{ end }}{{ "\n" }}{{ end }}{{ end }}{{ if .Alerts.Resolved }}RESOLVED ({{ len .Alerts.Resolved }}):{{ "\n" }}{{ range .Alerts.Resolved }}{{ .Annotations.summary }}{{ "\n" }}{{ end }}{{ end }}'
+        attributes:
+          severity: warning
+  # Heartbeat sink. DELIBERATELY a different topic from the two above. lgtm-watchdog has no human
+  # subscription, so a publish every 30m costs nothing and notifies nobody. Its ONLY consumer is the
+  # CloudWatch NumberOfMessagesPublished metric.
+  #
+  # DO NOT subscribe anything to this topic, and do not point it at lgtm-stack-alerts. That turns the
+  # heartbeat into 48 messages a day, and somebody mutes the channel within a week - which destroys
+  # the only out-of-band detector this stack has.
+  - name: sns-watchdog
+    sns_configs:
+      - topic_arn: arn:aws:sns:us-east-1:123456789012:lgtm-watchdog
+        sigv4:
+          region: us-east-1
+        subject: '[{{ .Status | toUpper }}] LGTM watchdog heartbeat'
+        message: 'alert delivery path is alive ({{ .Status }})'
+        attributes:
+          severity: watchdog

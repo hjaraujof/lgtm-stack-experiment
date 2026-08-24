@@ -1,0 +1,110 @@
+{{/*
+Loki.
+
+A STATEFULSET, NOT A DEPLOYMENT. Loki holds its chunks, its TSDB index and its compactor
+working directory on disk under /tmp/loki. A Deployment's pods share one PersistentVolume
+claim or none; a StatefulSet gives each pod a stable name and its OWN volume, created from
+the template at the bottom of this file. That is the correct shape for anything that owns
+data, and it is the shape Loki, Tempo, Mimir, Grafana and MinIO all take here.
+
+LOKI STAYS ON THE FILESYSTEM BACKEND. Tempo and Mimir point at MinIO; Loki does not. The
+reason is in config/loki-config.yaml: Loki does not migrate existing data across a store
+change, and the supported move ADDS a schema period with a future `from:` date. That is a
+dated deploy step, not a chart value, so it is out of scope here and stated rather than
+hidden.
+
+NO HEALTHCHECK IN COMPOSE, PROBES HERE. docker-compose.yml drops every healthcheck on this
+image because it is distroless - no shell, no wget, so a CMD-SHELL check can never run.
+Kubernetes does not shell out: kubelet performs the httpGet itself, from outside the
+container. The constraint that removed the Compose healthcheck simply does not apply.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "loki") | nindent 4 }}
+spec:
+  ports:
+    - name: http
+      port: 3100
+      targetPort: http
+    - name: grpc
+      port: 9096
+      targetPort: grpc
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "loki") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "loki") | nindent 4 }}
+spec:
+  serviceName: loki
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "loki") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # A CONFIGMAP CHANGE DOES NOT RESTART A POD. Without this annotation, `helm upgrade`
+        # updates the ConfigMap, the mounted file changes minutes later, and Loki keeps
+        # running its old config until something unrelated restarts it. The checksum makes
+        # the pod template differ, which is what triggers the rolling restart.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-backends.yaml") . | sha256sum }}
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "loki") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "lgtm.serviceAccountName" . }}
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Replaces the init-loki busybox chown service in docker-compose.yml.
+        fsGroup: 10001
+      containers:
+        - name: loki
+          image: {{ .Values.images.loki }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["-config.file=/etc/loki/config.yaml"]
+          ports:
+            - name: http
+              containerPort: 3100
+            - name: grpc
+              containerPort: 9096
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.loki.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki
+            - name: data
+              mountPath: /tmp/loki
+      volumes:
+        - name: config
+          configMap:
+            name: loki-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.loki.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.loki.persistence.size }}

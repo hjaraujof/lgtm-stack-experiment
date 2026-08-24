@@ -1,0 +1,33 @@
+# kind cluster for the LGTM stack.
+#
+#   kind create cluster --config k8s/kind/kind-cluster.yaml
+#
+# THREE NODES, NOT ONE. A single-node cluster hides the two mistakes this exercise is
+# most likely to make: a DaemonSet that is really a Deployment, and a PersistentVolume
+# that binds to one node and then blocks a reschedule. Both are invisible on one node.
+#
+# THE PORT MAPPINGS ARE THE INGRESS DOOR. ingress-nginx runs on the control-plane node
+# (it tolerates the control-plane taint and selects the ingress-ready label that the
+# node registers below). Without extraPortMappings, an Ingress object exists, resolves
+# and answers nothing, because no host port reaches the cluster.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lgtm
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+  - role: worker
+  - role: worker

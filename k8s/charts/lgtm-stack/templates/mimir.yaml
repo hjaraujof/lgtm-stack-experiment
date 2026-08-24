@@ -1,0 +1,183 @@
+{{/*
+Mimir, in monolithic mode.
+
+`-target=all,alertmanager` runs every component in one process. `all` does NOT include the
+Alertmanager, which is why it is named separately - the same argument docker-compose.yml
+passes. A real production Mimir splits these into separate Deployments per component; that
+is what the upstream mimir-distributed chart builds, and it is a reasonable next exercise
+once the monolith works here.
+
+THE RULES MOUNT IS THE DEPLOY MECHANISM. ruler_storage.backend=local scans
+<directory>/<tenant>/<namespace>, so the ConfigMap lands at /etc/mimir/rules/demo and each
+key becomes a namespace. Read-only, exactly as the `:ro` bind mount is in Compose.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimir
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 4 }}
+spec:
+  ports:
+    - name: http
+      port: 9009
+      targetPort: http
+    - name: grpc
+      port: 9095
+      targetPort: grpc
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mimir
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 4 }}
+spec:
+  serviceName: mimir
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-backends.yaml") . | sha256sum }}
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "lgtm.serviceAccountName" . }}
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: mimir
+          image: {{ .Values.images.mimir }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args:
+            - -target={{ .Values.mimir.target }}
+            - -config.file=/etc/mimir/config.yaml
+          env:
+            {{- include "lgtm.s3Env" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 9009
+            - name: grpc
+              containerPort: 9095
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            # Mimir reports not-ready for a stabilisation window after the ingester joins
+            # the ring. That is normal and is not a fault; the window is what this delay
+            # covers.
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.mimir.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mimir/config.yaml
+              subPath: config.yaml
+            - name: rules
+              mountPath: /etc/mimir/rules/demo
+              readOnly: true
+            - name: data
+              mountPath: /tmp/mimir
+      volumes:
+        - name: config
+          configMap:
+            name: mimir-config
+        - name: rules
+          configMap:
+            name: mimir-rules-demo
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.mimir.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.mimir.persistence.size }}
+{{- if .Values.mimir.alertmanagerReconciler.enabled }}
+---
+{{/*
+The Alertmanager tenant-config reconciler.
+
+WHY A DEPLOYMENT AND NOT A CRONJOB. The script is a loop with its own sleep, so it is
+already long-running, and a long-running process that must always exist is a Deployment. A
+CronJob would work only after rewriting the script to be one-shot, and the rewrite would
+lose the property that makes the loop worth having: an out-of-band write to the tenant
+config is reverted within one interval, not at the next scheduled minute.
+
+IT NEEDS NO S3 CREDENTIALS. It talks to Mimir's HTTP config API. Mimir is the one that
+writes to object storage.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mimir-am-reconciler
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir-am-reconciler") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir-am-reconciler") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-backends.yaml") . | sha256sum }}
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "mimir-am-reconciler") | nindent 8 }}
+    spec:
+      containers:
+        - name: reconciler
+          image: {{ .Values.images.initTools }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/bash", "/scripts/init-mimir-alertmanager.sh"]
+          env:
+            - name: MIMIR_URL
+              value: http://mimir:9009
+            - name: TENANT
+              value: {{ .Values.mimir.alertmanagerReconciler.tenant | quote }}
+            - name: AM_CONFIG_FILE
+              value: /config/demo-am.yaml
+            - name: RECONCILE_INTERVAL_SECS
+              value: {{ .Values.mimir.alertmanagerReconciler.intervalSecs | quote }}
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          volumeMounts:
+            - name: am-config
+              mountPath: /config
+              readOnly: true
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: am-config
+          configMap:
+            name: mimir-alertmanager-config
+        # THE IMAGE CARRIES THE TOOLCHAIN, THE CONFIGMAP CARRIES THE SCRIPT. That is the
+        # same separation the bind mount gives in Compose, and it keeps scripts/ the single
+        # source of truth: an edit there ships without a rebuild.
+        - name: scripts
+          configMap:
+            name: lgtm-scripts
+            defaultMode: 0755
+{{- end }}

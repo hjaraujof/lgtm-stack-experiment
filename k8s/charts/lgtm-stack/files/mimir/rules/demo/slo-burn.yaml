@@ -1,0 +1,259 @@
+# =========================================================================
+# SLO burn-rate, latency and absence alerting, per service, from the unbiased connector RED metrics
+# =========================================================================
+#
+# THE ERROR BUDGET IS A PLACEHOLDER. These rules assume a starting 99% availability SLO (a 1% error
+# budget) applied uniformly to every service. That budget is NOT validated against any measured
+# baseline. The multi-window multi-burn-rate STRUCTURE and the multipliers are the correct part; the
+# absolute budget is what you tune per service once you have real baselines.
+#
+# Multi-window multi-burn-rate follows the Google SRE workbook: a fast burn (budget exhausted in
+# about 2 days) pages, a slow burn (budget exhausted in a few days) tickets. BOTH windows must
+# breach, so a brief spike does not page.
+#
+# DEPLOY: `git pull` on the box and nothing else. ruler_storage is the bind-mounted `local` backend
+# (mimir-config.yaml) and the ruler re-scans it every poll_interval. No mimirtool load, no restart.
+# The Alertmanager config is NOT symmetrical - see scripts/init-mimir-alertmanager.sh.
+#
+# COST: every rule here is keyed by service_name only, the same low cardinality as the service:*
+# rules in red-recording.yaml, so ruler evaluation cost is negligible.
+#
+# SERVICE NAME CONVENTION: see the header of stack-alerts.yaml. Alerts scope to live envs with
+# `service_name=~"[^/]+/(prod|uat)/[^/]+"`, a regex on the middle segment of `<tenant>/<env>/<component>`.
+
+groups:
+  - name: slo-error-budget-recordings
+    interval: 30s
+    rules:
+      # Windowed AVAILABILITY ratios: the fraction of inbound HTTP requests answered 5xx.
+      # clamp_min avoids a divide-by-zero when a service has no traffic in the window.
+      #
+      # WHY HTTP STATUS CODE AND NOT SPAN STATUS. Three reasons, in increasing order of subtlety.
+      #
+      #   1. Span status over ALL span kinds measures INSTRUMENTATION DEPTH, not failure. One failing
+      #      request marks every decorated method span it touches, so a service with deep internal
+      #      instrumentation reads as catastrophically broken while its SERVER responses are clean.
+      #      A service can show a SERVER error ratio of 0 and an INTERNAL error ratio of 0.08, and
+      #      the unfiltered ratio pages on the second number.
+      #
+      #   2. A `span_kind="SPAN_KIND_SERVER"` filter fixes reason 1, and it is still not enough.
+      #      Under OTel semconv a 4xx does NOT set SERVER span status to Error. A service can answer
+      #      the large majority of its traffic 401 for days and read as a perfectly healthy 0.
+      #      Those 401s are deliberately NOT an availability breach - see ServiceAuthFailureRateHigh
+      #      below - but they must be VISIBLE somewhere, and span status cannot show them at all.
+      #
+      #   3. Status code is immune to the benign-error floor BY CONSTRUCTION. A caught-and-handled
+      #      internal error sets STATUS_CODE_ERROR on an INTERNAL span and never produces a 5xx
+      #      response, so it cannot enter this numerator. Every ratio built on span status carries
+      #      that floor and cannot subtract it. See red-recording.yaml.
+      #
+      # THE DENOMINATOR IS `http_response_status_code!=""`, NOT all SERVER spans. This matters more
+      # than it looks. Some frameworks emit SERVER spans from their OWN tracing that set neither
+      # http.response.status_code nor http.request.method, and leave span status UNSET even on
+      # failure. Next.js is the common case. If you divide by ALL SERVER spans, those services get a
+      # permanent, authoritative-looking 0% error rate - a FALSE GREEN, and typically on your
+      # highest-traffic web front ends.
+      #
+      # Restricting the denominator instead makes such a service produce NO SERIES, and
+      # ServiceAvailabilitySLIUnmeasurable below turns that silence into a visible alert.
+      # A MISSING MEASUREMENT MUST NOT READ AS A PASSING ONE.
+      - record: service:http_5xx_ratio:30m
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[30m]))
+            / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[30m])), 1e-9)
+      - record: service:http_5xx_ratio:1h
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[1h]))
+            / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[1h])), 1e-9)
+      - record: service:http_5xx_ratio:6h
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[6h]))
+            / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[6h])), 1e-9)
+
+      # Sustained auth-failure ratio. Deliberately a SEPARATE SLI from availability above.
+      #
+      # A 401 or 403 is the service working correctly: it authenticated the caller and said no. So it
+      # must not burn the availability budget. But a service that suddenly answers a large fraction
+      # of its traffic 401 is broken in a way users feel, and no availability SLI can see it.
+      #
+      # Only 401 and 403, not all 4xx. A 404 and a 422 are caller-driven and normal, and to fold them
+      # in would put a permanent floor under every service.
+      - record: service:http_auth_fail_ratio:30m
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"401|403"}[30m]))
+            / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[30m])), 1e-9)
+
+  - name: slo-burn-alerts
+    interval: 30s
+    rules:
+      # Fast burn: 14.4x the 1% budget (= a 14.4% error rate) on BOTH the 1h and 5m windows.
+      # At that rate the 30-day budget is gone in about 2 days, so page now.
+      - alert: ServiceErrorBudgetFastBurn
+        expr: |
+          service:http_5xx_ratio:1h{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (14.4 * 0.01)
+            and service:http_5xx_ratio:5m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (14.4 * 0.01)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: 'PROD/UAT {{ $labels.service_name }} burning error budget fast (>14.4% of inbound requests 5xx, 1h+5m) - 99% SLO at risk within ~2d'
+          runbook_url: 'docs/runbooks/service-error-budget.md'
+
+      # Slow burn: 6x the budget on BOTH the 6h and 30m windows, so ticket rather than page.
+      - alert: ServiceErrorBudgetSlowBurn
+        expr: |
+          service:http_5xx_ratio:6h{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (6 * 0.01)
+            and service:http_5xx_ratio:30m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (6 * 0.01)
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'PROD/UAT {{ $labels.service_name }} burning error budget (>6% of inbound requests 5xx, 6h+30m) - 99% SLO trending to breach'
+          runbook_url: 'docs/runbooks/service-error-budget.md'
+
+      # The failure class the availability SLO deliberately excludes.
+      #
+      # A prolonged auth outage - a large fraction of client-credential verifications answered 401 -
+      # is a production incident that a span-status stack CANNOT see. Common frameworks do not log
+      # 4xx by default, a caller that returns null on 401 fails silently, and every rule keyed on
+      # span status is untouched by a 4xx.
+      #
+      # SAMPLE-COUNT GATE, RE-DERIVED FOR THIS THRESHOLD RATHER THAN COPIED. This is the point worth
+      # transferring. ServiceLatencySLIBreach below gates at >300 requests/30m because at n=300 and
+      # p about 0.95 the standard error is roughly 1.3pp against a 5pp threshold band, a band/SE
+      # ratio of about 3.8. This alert separates about 0 from 10pp or more - a much WIDER band - so
+      # it reaches the same confidence at a much lower n: at n=150 and p=0.10 the SE is 2.4pp against
+      # a 10pp band, a ratio of about 4.1.
+      #
+      # To copy the 300 here would have been actively wrong. A modestly-trafficked auth service can
+      # sit near 150 requests/30m, so a 300 gate would exclude the exact service this alert exists to
+      # catch. DERIVE A GATE FROM THE BAND IT MUST RESOLVE, NOT FROM ANOTHER ALERT'S GATE - and never
+      # set one from a single day's traffic.
+      #
+      # The 10% threshold is not a "tune it later" placeholder like the 1% error budget above. On a
+      # healthy fleet every service sits at exactly 0 on this ratio, so there is no service whose
+      # normal operation puts it near the line. The denominator matches the availability SLI exactly,
+      # so the gate and both SLIs measure one population.
+      - alert: ServiceAuthFailureRateHigh
+        expr: |
+          service:http_auth_fail_ratio:30m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > 0.10
+            and sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!="",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 150
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'PROD/UAT {{ $labels.service_name }} answering >10% of inbound requests 401/403 over 30m at >150 req/30m (auth broken - NOT an availability breach, and invisible to span status)'
+          runbook_url: 'docs/runbooks/service-auth-failures.md'
+
+      # COVERAGE TRIPWIRE. The most important alert in this file, and the easiest one to silence.
+      #
+      # The two SLIs above can only see a service that emits http.response.status_code on its SERVER
+      # spans. A service that emits none produces NO SERIES rather than a 0. That is the honest
+      # outcome, and it is a SILENT one. This rule converts that silence into a ticket.
+      #
+      # It typically fires for exactly the services you can least afford to fly blind: server-rendered
+      # web front ends whose framework emits its own SERVER spans with no HTTP semconv attributes and
+      # span status UNSET even on failure. Until that is fixed, neither service has ANY server-side
+      # failure signal. WHOEVER SILENCES THIS IS CHOOSING TO FLY THOSE SERVICES BLIND, AND SHOULD
+      # HAVE TO SAY SO.
+      #
+      # It is a KNOWN TRADE-OFF, not an oversight, and the obvious fix is often the wrong one.
+      # Re-enabling a generic incoming-HTTP instrumentation to recover the status code can reinstate
+      # a duplicate server span that loses http.route, takes the routed span name with it, and logs
+      # an "operation on ended Span" error once per request. The fix belongs on the surviving
+      # framework span. See docs/runbooks/service-error-budget.md.
+      #
+      # `unless` on a >0 check, not a ratio: the question is whether ANY classifiable request exists,
+      # so it needs no denominator and no sample gate. The >300 req/30m gate keeps naturally sparse
+      # services out - they have nothing to measure either way.
+      - alert: ServiceAvailabilitySLIUnmeasurable
+        expr: |
+          (sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 300)
+            unless (sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!="",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 0)
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: 'PROD/UAT {{ $labels.service_name }} serves >300 inbound req/30m but emits NO http.response.status_code - it is invisible to the availability SLO and has no server-side failure signal'
+          runbook_url: 'docs/runbooks/service-error-budget.md'
+
+  - name: slo-latency-alerts
+    interval: 30s
+    rules:
+      # Latency SLI: the fraction of INBOUND REQUESTS served under 250ms. The tail-sampling "slow"
+      # threshold is 200ms, and 250ms is the nearest existing histogram boundary. Alerts when fewer
+      # than 95% are fast, which catches a latency regression a zero-error service would hide.
+      #
+      # `span_kind="SPAN_KIND_SERVER"` IS LOAD-BEARING. Without it this rule counts EVERY span kind,
+      # so it measures instrumentation volume rather than user-visible latency:
+      #   SERVER    what a user experiences.
+      #   CLIENT    a downstream call the callee already measures in its own SLI, so to count it here
+      #             double-counts the same latency in two services.
+      #   INTERNAL  an implementation detail.
+      #
+      # The effect is not marginal. A service with deep internal instrumentation can emit several
+      # HUNDRED internal spans per inbound request, so an unfiltered ratio is almost entirely
+      # internal-span noise. That noise cuts BOTH ways: it MASKS a real regression on a deeply
+      # instrumented service, and it FIRES on a service that serves 100% of its inbound requests
+      # under the threshold. Under an unfiltered rule, adding instrumentation moves the "SLO" with no
+      # user-visible change whatsoever.
+      - record: service:latency_fast_ratio:30m
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_duration_milliseconds_bucket{span_kind="SPAN_KIND_SERVER",le="250"}[30m]))
+            / clamp_min(sum by (service_name) (rate(traces_span_metrics_duration_milliseconds_count{span_kind="SPAN_KIND_SERVER"}[30m])), 1e-9)
+
+      # MINIMUM-TRAFFIC GATE. Read this before you change the window or the threshold.
+      #
+      # A RATE gate (say >0.2 req/s) does NOT stabilize a ratio. Bursty low-QPS services that straddle
+      # the gate still flap, because a single cold-start request collapses a near-empty window. The
+      # root cause is SAMPLE COUNT, not rate: a short window with a handful of requests yields a noisy
+      # ratio regardless of the instantaneous rate. So gate on ABSOLUTE request count in the window.
+      #
+      # THE WINDOW AND THE GATE ARE COUPLED. When the SLI gained its span_kind filter, a 300-request
+      # gate over 5m silenced the alert ENTIRELY - with only SERVER spans counted, no service cleared
+      # 300 requests in 5 minutes. The gate exists for SAMPLE COUNT, so the fix is to WIDEN THE
+      # WINDOW, not to lower the bar. At n=300 and p about 0.95 the ratio's standard error is roughly
+      # 1.3pp, small against the 5pp threshold band. Hence 30m.
+      #
+      # `for:` is 15m, not 30m. A 30m ratio window already smooths the bursty single-window case that
+      # a long `for:` would absorb, so to keep both would mean about an hour of sustained breach
+      # before a page.
+      #
+      # THE GATE USES THE SAME _count METRIC AS THE RATIO DENOMINATOR, so gate and SLI measure the
+      # identical request population, and it is aggregated `by (service_name)` so the `and` still
+      # vector-matches per service. The env regex is applied to BOTH sides of the `and`; to filter
+      # only one side drops the match and silences the alert.
+      #
+      # EXCLUDING LOW-TRAFFIC SERVICES IS CORRECT, NOT A COVERAGE GAP. A sparse service's p99 is
+      # typically a flat few milliseconds while its fast-ratio swings between 0 and 1 as pure
+      # sparse-window noise. A ratio-based latency SLO is only meaningful with enough samples; these
+      # services have no measurable latency SLO to breach. They remain covered for ERRORS by
+      # HighServiceErrorRatio and the count-based burn-rate alerts above.
+      - alert: ServiceLatencySLIBreach
+        expr: |
+          service:latency_fast_ratio:30m{service_name=~"[^/]+/(prod|uat)/[^/]+"} < 0.95
+            and sum by (service_name) (increase(traces_span_metrics_duration_milliseconds_count{span_kind="SPAN_KIND_SERVER",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 300
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'PROD/UAT {{ $labels.service_name }} <95% of INBOUND requests under 250ms over 30m at >300 req/30m (latency regression - fires even with zero errors)'
+          runbook_url: 'docs/runbooks/service-latency.md'
+
+  - name: slo-absence-alerts
+    interval: 30s
+    rules:
+      # Per-service telemetry absence: a service that WAS reporting an hour ago and has now vanished.
+      # SpanMetricsPipelineSilent only catches the WHOLE pipeline dying. This catches ONE service
+      # going dark - a deploy broke instrumentation, a crash loop, a renamed endpoint - while the
+      # others keep reporting.
+      #
+      # Gate on ACTUAL TRAFFIC an hour ago (>0.2 req/s), not on mere series presence. The naive form
+      # `count(... offset 1h) > bool 0` fires for any service that merely had a SERIES an hour ago,
+      # even at rate 0, so a naturally sparse or intermittent service false-fires "stopped emitting"
+      # on every idle hour. Same sparse-service weakness that the traffic gate fixes in
+      # ServiceLatencySLIBreach above.
+      - alert: ServiceTelemetrySilent
+        expr: |
+          (count by (service_name) (service:requests:rate5m offset 1h > 0.2) > bool 0) == 1
+            unless (count by (service_name) (service:requests:rate5m) > bool 0) == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: '{{ $labels.service_name }} stopped emitting telemetry (was >0.2 req/s 1h ago, silent now) - broken instrumentation or dead service'
+          runbook_url: 'docs/runbooks/service-absent.md'

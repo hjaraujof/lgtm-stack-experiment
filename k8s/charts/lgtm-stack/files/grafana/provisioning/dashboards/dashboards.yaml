@@ -1,0 +1,41 @@
+# Dashboard provisioning configuration
+
+apiVersion: 1
+
+providers:
+  # demo-service dashboards - placed in "demo-service" folder
+  - name: 'demo-service'
+    orgId: 1
+    folder: 'demo-service'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/demo-service
+
+  # LGTM stack self-health - the self-scraped internal series that drive stack-alerts.yaml, made
+  # visible during an incident instead of alert-only. Zero new ingest: every panel reads a series
+  # the stack already stores.
+  - name: 'lgtm-health'
+    orgId: 1
+    folder: 'LGTM Stack'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/lgtm-health
+
+  # Golden-path per-service RED template. A `service_name` variable dashboard over the recorded
+  # series in red-recording.yaml, so any newly instrumented service appears with ZERO bespoke
+  # dashboard work. Prefer extending this over hand-writing one dashboard per service.
+  - name: 'services'
+    orgId: 1
+    folder: 'Services'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/services

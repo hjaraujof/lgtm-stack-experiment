@@ -1,0 +1,551 @@
+# OpenTelemetry Collector configuration for the LGTM stack.
+#
+#   - span-metrics and service-graphs are computed on the FULL pre-sample stream via connectors,
+#     so RED metrics are UNBIASED: they see every request, not only the tail-sampled ones.
+#   - tail_sampling stores 100% of low-volume envs plus every error and slow trace anywhere, and
+#     samples the high-volume env at 10%.
+#   - the internal-telemetry scrape jobs pull each component's own /metrics back into Mimir, which
+#     is what makes the stack's silent-failure modes alertable at all.
+#
+# VALIDATE BEFORE ANY APPLY, from the repo root:
+#   docker run --rm -v "$PWD/config/otel-collector-config.yaml:/c.yaml:ro" -v /:/hostfs:ro \
+#     otel/opentelemetry-collector-contrib:0.142.0 validate --config=/c.yaml
+#
+# The `-v /:/hostfs:ro` is REQUIRED and is not about your edit. `validate` instantiates receivers,
+# and the hostmetrics receiver below sets root_path: /hostfs, so without the mount it always fails
+# with `invalid root_path: stat /hostfs: no such file or directory` — on a pristine checkout too.
+# Docker Desktop may refuse to bind `/`; mount any readable dir instead, e.g. `-v /tmp:/hostfs:ro`.
+# The path only has to exist for the receiver to construct.
+#
+# A clean exit 0 is only meaningful if the validator actually parses what you changed. It DOES check
+# OTTL: swap a `delete_key` for a bogus function and it reports `unable to parse OTTL statement ...
+# undefined function`. .github/workflows/config-check.yml runs exactly that as a positive control.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  # Disk-backed persistent sending queue. This survives a collector restart and a brief backend
+  # outage; `retry_on_failure` alone only covers in-memory retries inside max_elapsed_time, so
+  # whatever sits in the queue at restart is lost without this.
+  #
+  # The directory is a named volume chowned to UID 10001 by the init-otelcol-queue service. Used by
+  # the tempo and loki exporters below, but NOT by prometheusremotewrite/mimir: PRW ordering
+  # requirements and a persistent queue interact poorly.
+  file_storage/queue:
+    directory: /var/lib/otelcol/queue
+    create_directory: true
+    timeout: 10s
+  # Profiling and live debug. pprof serves Go CPU and heap profiles, which is the only way to
+  # attribute collector CPU to a real cause rather than a guess; zpages shows live pipeline state.
+  #
+  # Bound to 0.0.0.0 IN-CONTAINER but published ONLY to 127.0.0.1 on the host — see the ports list
+  # in docker-compose.yml. They are loopback-reachable, not network-exposed.
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Host metrics for the box, so its binding constraint lives in Mimir next to the pipeline metrics
+  # rather than only in an external monitoring system. Reads host stats through a read-only /hostfs
+  # mount. Roughly 50-100 low-cardinality series; a 60s interval keeps the CPU cost negligible.
+  hostmetrics:
+    collection_interval: 60s
+    root_path: /hostfs
+    scrapers:
+      cpu: {}
+      memory: {}
+      load: {}
+      filesystem: {}
+      network: {}
+
+  # INTERNAL TELEMETRY SCRAPES. Each component's own /metrics, pulled back into Mimir so the stack's
+  # silent-failure modes become alertable. Everything here is filtered hard downstream by
+  # filter/internal_metrics — these payloads are large, and the point is a handful of series, not all
+  # of them.
+  prometheus/internal:
+    config:
+      scrape_configs:
+        # `honor_timestamps: false` makes the collector stamp each scraped sample with its OWN
+        # receive time instead of the exposition timestamp. Re-ingesting a component's /metrics back
+        # into Mimir otherwise produces sample_duplicate_timestamp discards from exact-timestamp
+        # collisions. The relay is required (Mimir does not self-ingest, so cortex_* series exist
+        # ONLY through it), and this flag breaks the collision without losing any series.
+        #
+        # SCALE NOTE, because this is easy to over-blame: these four jobs write a few dozen series
+        # in total, so their contribution is on the order of ONE sample per second. If you are
+        # chasing a duplicate-timestamp rate in the hundreds or thousands per second, it is
+        # arithmetically not coming from here. Look at resource_metrics_key_attributes below.
+        - job_name: tempo-internal
+          scrape_interval: 30s
+          honor_timestamps: false
+          static_configs:
+            - targets: ['tempo:3200']
+              labels:
+                collector_scrape: 'lgtm-internal'
+        # Mimir-side silent-failure modes that otherwise have NO watcher: sample discards, block
+        # upload failures, compactor-run failures, active-series cardinality growth, and the
+        # alert-path counters that make a dead Alertmanager visible.
+        - job_name: mimir-internal
+          scrape_interval: 30s
+          honor_timestamps: false
+          # Mimir's /metrics exposes the ruler-written ALERTS and ALERTS_FOR_STATE synthetic series,
+          # one per firing or pending alert. Scraping them here re-ingests them into Mimir and
+          # collides with the ruler's OWN authoritative write of the same series. Keep this drop.
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: 'ALERTS|ALERTS_FOR_STATE'
+              action: drop
+          static_configs:
+            - targets: ['mimir:9009']
+              labels:
+                collector_scrape: 'lgtm-internal'
+        # THE COLLECTOR'S OWN TELEMETRY. This closes the blind spot that hides a tail_sampling
+        # outage: with these scraped and alerted, tail_sampling dropping 100% of traces PAGES,
+        # instead of surfacing days later as "only one service appears in Explore".
+        - job_name: otelcol-internal
+          scrape_interval: 30s
+          honor_timestamps: false
+          static_configs:
+            - targets: ['localhost:8888']
+              labels:
+                collector_scrape: 'lgtm-internal'
+        # Loki, for the per-tenant stream gauge and the discard counters.
+        - job_name: loki-internal
+          scrape_interval: 30s
+          honor_timestamps: false
+          metric_relabel_configs:
+            # A keep-only relabel AT SCRAPE TIME, so Loki's large /metrics never enters the pipeline.
+            #
+            # `loki_ingester_memory_streams` carries a `tenant` label. A non-zero value for
+            # tenant="fake" means headerless (misrouted) logs are landing on the default tenant.
+            # A GAUGE is the right instrument for that alert: it reads live state, which is what
+            # "are there fake streams RIGHT NOW" asks.
+            #
+            # The discard counters are what make silent per-entry loss visible. Loki validates PER
+            # ENTRY, so it can drop oversized entries indefinitely while the push still succeeds for
+            # the remainder — with no alert anywhere if these counters never leave the box.
+            #
+            # SUFFIX WARNING: `_total` is required BOTH here AND in the downstream
+            # filter/internal_metrics allowlist. Loki serves standard Prometheus exposition, so the
+            # suffix is present at scrape and survives into Mimir. Get either end wrong and this
+            # keeps NOTHING, silently. See the per-source note on filter/internal_metrics.
+            - source_labels: [__name__]
+              regex: 'loki_ingester_memory_streams|loki_discarded_samples_total|loki_discarded_bytes_total'
+              action: keep
+          static_configs:
+            - targets: ['loki:3100']
+              labels:
+                collector_scrape: 'lgtm-internal'
+
+connectors:
+  # Fan the full (normalized, pre-sample) stream from traces/in into the sampling pipeline.
+  forward: {}
+
+  # RED metrics computed on 100% of traffic (runs BEFORE tail_sampling -> unbiased).
+  # Default emitted metrics: calls_total (counter) + duration histogram. Labels include
+  # service.name, span.name, span.kind, status.code plus the dimensions below.
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2500ms, 5s, 10s]
+    dimensions:
+      # service.namespace is NOT a dimension here. transform/normalize below DELETES the attribute
+      # at ingest, so declaring it could only ever emit an empty label. See that processor for why.
+      #
+      # A DECLARED DIMENSION IS NOT AN EMITTED ONE. If the apps never set the resource attribute, the
+      # label is empty on every series and any `sum by (...)` over it collapses everything into one
+      # meaningless series. Verify before you aggregate:
+      #   count by (<label>) (traces_span_metrics_calls_total)
+      - name: http.request.method      # stable semconv (NOT deprecated http.method)
+      - name: http.response.status_code
+    exemplars:
+      enabled: true
+    metrics_flush_interval: 60s
+    # THE SINGLE WRITER PRINCIPLE, and the most expensive line in this file to get wrong.
+    #
+    # The DEFAULT for this option is EMPTY, which means the connector keys its resource-metrics cache
+    # on the FULL resource attribute set. Every process and every deploy is a distinct resource — it
+    # differs by process_pid, host_id, service_version — even when the apps never set
+    # service.instance.id. So a service running N processes emits N separate ResourceMetrics whose
+    # METRIC label set is BYTE-IDENTICAL, because none of the dimensions above, nor the built-ins
+    # (service.name / span.name / span.kind / status.code), distinguishes a resource.
+    #
+    # The Prometheus remote-write exporter then appends them as multiple samples on ONE TimeSeries at
+    # ONE timestamp. Mimir keeps the first and rejects the rest as duplicate-timestamp. Upstream calls
+    # this a Single Writer Principle violation, and this option is the documented guard.
+    #
+    # HOW BAD IT GETS, and why the failure is so hard to spot: this can discard the great majority of
+    # every sample pushed, for weeks. RED metrics then report a fraction of a percent of real
+    # traffic, and the busiest service can read literally 0/s while the GLOBAL aggregate holds a
+    # small non-zero residue — which defeats any `== 0` pipeline detector. That is what
+    # SpanMetricsPipelineImplausiblyLow exists to catch.
+    #
+    # EXPECT AT CUTOVER, if you are adding this to a stack that ran without it: calls_total and
+    # duration values JUMP UP by ORDERS OF MAGNITUDE. That is the undercount being CORRECTED, not a
+    # regression. It is a step increase rather than a counter reset, so rate() spikes for one
+    # interval — silence HighServiceErrorRatio and the slo-burn alerts across the restart.
+    #
+    # DO NOT "FIX" THIS BY SETTING service.instance.id IN THE APPS. That mints a series per process
+    # and multiplies cardinality by the process count, against max_global_series_per_user.
+    #
+    # Keying on service.name alone is the guard. Do NOT add service.namespace: it is deleted upstream
+    # by transform/normalize, so it can no longer distinguish anything, and leaving it here is the
+    # trap that caused the original fork — emitters that set it and emitters that did not hashed to
+    # DIFFERENT buckets, so one logical service split into two permanent series sets.
+    resource_metrics_key_attributes:
+      - service.name
+    # metrics_expiration bounds the cache. The default (0 = never expire) is unsafe here for a reason
+    # that is not obvious: resource identity is only ONE of the two accumulators. The other is
+    # span.name, a dimension whose value space is set by the PRODUCER, so the cache grows with the
+    # union of every name ever seen — and the WHOLE cache ships as one write every
+    # metrics_flush_interval. An unbounded span name (a full URL, a per-user path) therefore turns
+    # into a permanent, growing flush payload and eventually a 429 storm.
+    #
+    # transform/normalize below templates ids out of span names, which removes the usual driver. THIS
+    # SETTING IS THE BACKSTOP for whatever unbounded dimension appears next, so the failure mode is a
+    # bounded cache instead.
+    #
+    # 48h, NOT the 5-15m that is conventional, and the constraint is your own QUERIES: an
+    # expired-then-returning series restarts at 0, which reads as a COUNTER RESET. Set this longer
+    # than the longest reset-sensitive window any rule, report or dashboard reads. 48h gives a full
+    # 24h of margin over a 24h report window.
+    # IF A RULE OR REPORT EVER READS A WINDOW LONGER THAN 24h, RAISE THIS IN LOCKSTEP.
+    metrics_expiration: 48h
+
+  # Service dependency graph metrics on 100% of traffic.
+  servicegraph:
+    latency_histogram_buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2500ms, 5s, 10s]
+    # service.namespace dropped as a dimension for the same reason as spanmetrics: the attribute no
+    # longer exists on the stream, so this could only emit an empty label.
+    store:
+      max_items: 10000
+      ttl: 2s
+
+processors:
+  batch:
+    send_batch_size: 1024
+    timeout: 1s
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 25
+  # Keep ONLY the incident-relevant internal metrics from the scrape jobs above. These /metrics
+  # payloads run to well over a thousand series each, and this stack needs a few dozen.
+  #
+  # EVERY NAME BELOW WAS PREVIOUSLY BEING SCRAPED AND THEN THROWN AWAY HERE. That is why an alert
+  # path can die with no queryable evidence: the numbers that prove it exist only if you curl the box
+  # by hand. Nothing in Mimir can see them, so no rule can alert on them. What this list drops is
+  # what your alerts can never know.
+  #
+  # What each group buys:
+  #   tempo_*                                   discard tripwires, compaction stall, live-store depth
+  #   cortex_discarded_samples                  Mimir ingestion and validation loss
+  #   cortex_ingester_memory_series             cardinality growth
+  #   cortex_ingester_shipper_upload_failures   object-store write failure
+  #   cortex_compactor_runs_failed              compaction failure
+  #   otelcol_processor_tail_sampling_*         the outage-catcher: traces dropped before decision
+  #   otelcol_exporter_send_failed_*            export failing to a backend
+  #   otelcol_exporter_queue_*                  export backpressure
+  #   otelcol_receiver_accepted/refused_*       ingest volume. WITHOUT accepted_*, refused_* is
+  #                                             UNANSWERABLE: a flat 0 refused reads identically
+  #                                             whether the collector is healthy or receiving nothing
+  #                                             at all. accepted:refused is the ratio that makes both
+  #                                             interpretable.
+  #   cortex_prometheus_notifications_sent      ruler -> Alertmanager: "alerts ARE being raised"
+  #   cortex_alertmanager_notifications         Alertmanager -> receiver: the half that goes to zero
+  #   cortex_alertmanager_notification_errors   Alertmanager -> receiver, FAILING. A different failure
+  #                                             from dispatching nothing; both need watching.
+  #   cortex_alertmanager_config_hash           out-of-band config-write detector
+  #   loki_discarded_samples / _bytes           the per-entry discard tripwire Loki otherwise lacks
+  #
+  # ============================ SUFFIXES ARE PER-SOURCE. READ THIS. ============================
+  #   cortex_* / tempo_* / loki_*  scraped from standard Prometheus exposition. They ARRIVE and are
+  #                                STORED with `_total`. Match them WITH the suffix.
+  #   otelcol_*                    the collector's own :8888 telemetry is OTel-native and exposes
+  #                                counters with NO suffix. The remote-write exporter ADDS `_total`
+  #                                on write. Match them WITHOUT it, and query them WITH it.
+  # Both forms below are correct and neither is a typo. GETTING ONE WRONG KEEPS NOTHING AND FAILS
+  # SILENTLY. That is not hypothetical: writing the two alertmanager counters in the stripped form
+  # meant they never reached Mimir, which left AlertDeliverySilent permanently inert — its `sent > 0`
+  # guard can never be true if the series does not exist. Gauges have no suffix in either world.
+  # =============================================================================================
+  filter/internal_metrics:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'name != "tempo_discarded_spans_total" and name != "tempodb_compaction_outstanding_blocks" and name != "tempo_live_store_live_traces" and name != "tempo_live_store_complete_queue_length" and name != "tempo_live_store_back_pressure_seconds_total" and name != "prometheus_remote_storage_samples_failed_total" and name != "cortex_discarded_samples_total" and name != "cortex_ingester_memory_series" and name != "cortex_ingester_shipper_upload_failures_total" and name != "cortex_compactor_runs_failed_total" and name != "otelcol_processor_tail_sampling_sampling_trace_dropped_too_early" and name != "otelcol_processor_tail_sampling_count_traces_sampled" and name != "otelcol_processor_tail_sampling_sampling_traces_on_memory" and name != "otelcol_exporter_send_failed_spans" and name != "otelcol_exporter_send_failed_metric_points" and name != "otelcol_exporter_send_failed_log_records" and name != "otelcol_exporter_queue_size" and name != "otelcol_exporter_queue_capacity" and name != "otelcol_receiver_refused_spans" and name != "otelcol_receiver_accepted_spans" and name != "otelcol_receiver_accepted_metric_points" and name != "otelcol_receiver_refused_metric_points" and name != "otelcol_receiver_accepted_log_records" and name != "otelcol_receiver_refused_log_records" and name != "loki_ingester_memory_streams" and name != "loki_discarded_samples_total" and name != "loki_discarded_bytes_total" and name != "cortex_prometheus_notifications_sent_total" and name != "cortex_alertmanager_notifications_total" and name != "cortex_alertmanager_notification_errors_total" and name != "cortex_alertmanager_config_hash"'
+
+  # OPTIONAL SOURCE CUT — an EXAMPLE, disabled by default because the span names below are specific
+  # to one codebase. Fill in your own names and add it back to the traces/in pipeline to use it.
+  #
+  # THE LESSON IS THE PART THAT TRANSFERS, and it has two halves:
+  #
+  #   1. Drop volume AT INGEST, before the expensive connectors and tail_sampling. Placed first in
+  #      traces/in, a filter that removes a large fraction of spans is a direct CPU reduction. Placed
+  #      later, it saves almost nothing. Auto-instrumented internal bookkeeping methods are often a
+  #      surprisingly large share of the total span stream while carrying near-zero diagnostic value.
+  #
+  #   2. ONLY EVER DROP A LEAF SPAN. A leaf span has no children to orphan, so a name-based drop is
+  #      safe. Dropping a WRAPPER span ORPHANS its children — they point at a parent that is no
+  #      longer in the trace, and the trace becomes unreadable. Confirm a span is a leaf before you
+  #      add its name here.
+  #
+  # HONEST CAVEAT ON THE CPU CLAIM: a filter is not free. The OTTL condition is evaluated against the
+  # FULL stream, which offsets some of the saving. Measure before and after rather than assume.
+  # Cutting the volume at the SOURCE — not emitting the spans at all — is the only unambiguous lever.
+  #
+  # filter/drop_bookkeeping:
+  #   error_mode: ignore
+  #   traces:
+  #     span:
+  #       - 'name == "YourLeafBookkeepingClass.methodA"'
+  #       - 'name == "YourLeafBookkeepingClass.methodB"'
+
+  # Normalizes the two things that pollute metric identity: high-cardinality span NAMES, and the
+  # redundant service.namespace resource attribute.
+  #
+  # WHY service.namespace IS DELETED RATHER THAN KEPT:
+  # service.name is already the compound `<tenant>/<env>/<component>`, so a service.namespace of
+  # `tenant-a` is pure duplication. The remote-write exporter derives `job` as
+  # `<service.namespace>/<service.name>`, which mints a DOUBLED job value like
+  # `tenant-a/tenant-a/prod/orders-api` for every service whose instrumentation sets it.
+  #
+  # Worse, if service.namespace is also in resource_metrics_key_attributes, then emitters WITH it and
+  # emitters WITHOUT it hash to DIFFERENT spanmetrics buckets — the same logical service forks into
+  # two permanent series sets, and older services on older instrumentation land on one fork while
+  # newer ones land on the other. Deleting the ATTRIBUTE unifies both populations onto one job value.
+  #
+  # This is why "just delete the legacy series" is the wrong instinct: some of those legacy-form
+  # series are LIVE, belonging to services on older instrumentation that never set the attribute.
+  # Deleting them would wipe those services' RED metrics entirely. Check whether a series is frozen
+  # (`increase(...[6h]) == 0`) before you call it dead.
+  #
+  # WHY HERE AND NOT LATER: this MUST run BEFORE the spanmetrics connector. Stripping it downstream
+  # would leave two live buckets inside the connector that then collapse onto ONE remote-write
+  # TimeSeries at one timestamp — re-creating the exact duplicate-timestamp failure that
+  # resource_metrics_key_attributes exists to fix.
+  #
+  # EXPECT AT CUTOVER: for each revived job value the connector starts a fresh bucket at 0 while
+  # Mimir still holds the frozen series at its last value, so rate() sees ONE counter reset. Harmless
+  # and self-correcting, but silence HighServiceErrorRatio and the slo-burn alerts across the restart.
+  #
+  # THE ROOT CAUSE IS UPSTREAM: the instrumentation sets service.namespace to a value service.name
+  # already encodes. Fixing it there is correct, and needs every service redeployed. This normalizes
+  # the whole fleet at one point instead.
+  transform/normalize:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - replace_pattern(name, "\\?.*$", "")
+          # A QUERY-STRING STRIP IS NOT ENOUGH. High-cardinality ids live in the PATH too, and
+          # span.name is a spanmetrics dimension, so EVERY DISTINCT ID MINTS A PERMANENT LABEL COMBO
+          # — (buckets + 3) samples every flush interval, forever, if metrics_expiration is unset.
+          #
+          # The usual driver is a framework that names client spans after the FULL URL. One
+          # server-rendered front end doing that can emit one span_name PER USER and account for the
+          # majority of the entire stack's label combinations on its own, with no plateau.
+          #
+          # NOTHING DIAGNOSTIC IS LOST: the full URL stays queryable on the span itself, under
+          # http.url or http.target depending on which instrumentation emitted it. Only the NAME is
+          # templated, and that is what turns per-user series into one series.
+          #
+          # FIXING IT AT SOURCE IS BETTER WHERE YOU CAN. Some frameworks let you disable their own
+          # fetch instrumentation (Next.js: NEXT_OTEL_FETCH_DISABLED=1), and the underlying HTTP
+          # client library usually emits a strictly better span anyway: a bounded name, stable
+          # semconv attributes, and a response status code the framework's span often lacks.
+          #
+          # THIS TEMPLATING STAYS REGARDLESS. It is the only thing that covers services nobody has
+          # audited, and it is the backstop when a future framework reintroduces URL-shaped names.
+          #
+          # ORDER MATTERS: UUIDs first, because they contain no `/`. Then bare numeric path segments.
+          # The numeric rule requires 4 or more digits so real path words survive — `/v1` and
+          # `/api/v2` are untouched, while `/12345` becomes `/{id}`.
+          - replace_pattern(name, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "{id}")
+          - replace_pattern(name, "/[0-9]{4,}", "/{id}")
+      - context: resource
+        statements:
+          - delete_key(attributes, "service.namespace")
+
+  # Application OTLP metrics, for the `metrics` pipeline.
+  #
+  # The Prometheus remote-write translation maps resource attributes to job and instance ONLY:
+  # job = `<service.namespace>/<service.name>`, instance = service.instance.id. That makes app
+  # metrics unusable in this stack for two reasons:
+  #   1. NO `service_name` LABEL. Every dashboard, recording rule and SLO alert here keys on
+  #      service_name, which the spanmetrics connector synthesises. App metrics join none of them.
+  #   2. job is DOUBLED, because service.name already carries the tenant. transform/normalize solves
+  #      this for traces; metrics needs the same, and then job == service_name.
+  #
+  # DELIBERATELY NOT the exporter's `resource_to_telemetry_conversion`. That promotes EVERY resource
+  # attribute — including service.version, which is a new label value every release, so every deploy
+  # mints a fresh series — and service.instance.id. Copying ONE attribute adds one label with one
+  # value per service. The blanket flag is a cardinality trap.
+  transform/app_metrics:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["service_name"], resource.attributes["service.name"])
+      - context: resource
+        statements:
+          - delete_key(attributes, "service.namespace")
+
+  tail_sampling:
+    decision_wait: 10s
+    # SIZING. num_traces is the in-memory ring buffer of traces held during the decision_wait window.
+    # The working set is roughly (traces/sec x decision_wait).
+    #
+    # IF num_traces IS SMALLER THAN THAT WORKING SET, traces are evicted BEFORE their decision
+    # completes, they are marked unsampled, and NOTHING is exported to Tempo. The symptom is
+    # brutal and misleading: a burst appears at each restart (the buffer flush) and then the trace
+    # view freezes. `expected_new_traces_per_sec` sizes internal maps and should match your measured
+    # rate, not a default.
+    #
+    # Measure before you set these:  rate(otelcol_receiver_accepted_spans_total[5m]) / spans-per-trace
+    # CollectorTailSamplingDroppingTraces is the alert that catches it if you get them wrong.
+    num_traces: 400000
+    expected_new_traces_per_sec: 20000
+    # Policies are OR'd: a trace is kept if ANY matches.
+    #
+    # Strategy: keep 100% of the LOW-volume environments, because full fidelity
+    # is cheap there and it makes their dashboards usable; keep 100% of errors
+    # and slow traces everywhere; and probabilistically sample the remainder,
+    # which is where the live_traces_exceeded risk lives.
+    #
+    # WHICH environments are low-volume is a property of YOUR deployment, not a
+    # given. Measure it before you copy this split:
+    #   sum by (service_name) (rate(traces_span_metrics_calls_total[1h]))
+    # Then put the low-volume ones in keep-lowvolume-envs below. The example
+    # keeps dev and prod and samples qa; yours may be the other way round.
+    policies:
+      - name: keep-lowvolume-envs
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values:
+            - ".*/(dev|prod)/.*"     # EXAMPLE: adjust to your own low-volume envs
+          enabled_regex_matching: true
+          cache_max_size: 200
+      - name: keep-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: keep-slow
+        type: latency
+        # DERIVE THIS FROM YOUR OWN MEASURED LATENCY, not from this number. Set it at roughly 2x the
+        # p99 of your slowest inbound request kind, read off the unbiased connector metrics:
+        #   histogram_quantile(0.99, sum by (le) (
+        #     rate(traces_span_metrics_duration_milliseconds_bucket{span_kind="SPAN_KIND_SERVER"}[1h])))
+        #
+        # Measure on SERVER spans only. An all-span p99 is dominated by internal spans and reads far
+        # lower than what a user experiences, so a threshold derived from it keeps almost nothing.
+        #
+        # KEEP THIS IN STEP WITH THE LATENCY SLI. slo-burn.yaml measures the fraction of requests
+        # under the 250ms histogram bucket, chosen as the nearest boundary above this threshold. If
+        # you move this, check that the SLI still reads a bucket that means the same thing.
+        latency:
+          threshold_ms: 200
+      - name: sample-remainder
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10   # applies only to what the policies above did not already keep
+
+exporters:
+  otlphttp/tempo:
+    endpoint: http://tempo:14318
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    # Persist queued traces to disk, so a collector restart or a backend outage does not drop them.
+    sending_queue:
+      enabled: true
+      storage: file_storage/queue
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    # SET THE LOKI TENANT EXPLICITLY, symmetric with the Mimir exporter below. Without this header,
+    # logs land on Loki's default `fake` tenant, which routes to whatever the OLDEST schema period
+    # defines — often a filesystem period that cannot flush at all on a current Loki release. The
+    # LokiTenantFakeIngest alert exists to catch a producer that drifts back to headerless.
+    headers:
+      X-Scope-OrgID: "demo"
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    # Persist queued logs to disk, same rationale as tempo.
+    sending_queue:
+      enabled: true
+      storage: file_storage/queue
+  prometheusremotewrite/mimir:
+    endpoint: http://mimir:9009/api/v1/push
+    headers:
+      X-Scope-OrgID: "demo"
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+service:
+  extensions: [health_check, file_storage/queue, pprof, zpages]
+  pipelines:
+    # Full 100% stream: normalize names, compute metrics (connectors), fan out to the sampling
+    # pipeline. To enable the optional source cut, add filter/drop_bookkeeping FIRST in this list —
+    # before the expensive connectors, or it saves nothing.
+    traces/in:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/normalize]
+      exporters: [spanmetrics, servicegraph, forward]
+    # Host metrics for the box. Its binding constraint lives alongside the pipeline metrics rather
+    # than only in an external monitoring system.
+    metrics/host:
+      receivers: [hostmetrics]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite/mimir]
+    # Only sampled traces are stored as searchable traces in Tempo.
+    traces/store:
+      receivers: [forward]
+      processors: [tail_sampling, batch]
+      exporters: [otlphttp/tempo]
+    # Connector output (unbiased RED + service graph) -> Mimir.
+    metrics/gen:
+      receivers: [spanmetrics, servicegraph]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite/mimir]
+    # Application metrics from the OTel SDKs. transform/app_metrics gives them the service_name label
+    # the rest of this stack keys on, and un-doubles job. See the processor comment.
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/app_metrics, batch]
+      exporters: [prometheusremotewrite/mimir]
+    # Internal /metrics scrapes, filtered to incident-relevant series -> Mimir. THIS PIPELINE IS WHAT
+    # MAKES THE STACK'S OWN FAILURES ALERTABLE: Tempo discards and compaction stalls, Mimir sample
+    # discards and block-upload failures, collector tail-sampling drops and export failures, Loki
+    # per-entry discards, and the alert-path counters.
+    metrics/internal:
+      receivers: [prometheus/internal]
+      processors: [filter/internal_metrics, memory_limiter, batch]
+      exporters: [prometheusremotewrite/mimir]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]
+  telemetry:
+    logs:
+      level: "info"

@@ -1,0 +1,105 @@
+{{/*
+Tempo.
+
+Trace BLOCKS go to object storage (MinIO here, S3 on AWS). The local volume still matters
+and is not a leftover: the write-ahead log, the block scratch directory and the metrics
+generator's own WAL all stay on disk. Losing that volume loses whatever has not flushed.
+
+THE PORTS ARE NOT THE OBVIOUS ONES. 14317 and 14318 are Tempo's INTERNAL OTLP receivers,
+addressed by the collector as http://tempo:14318. 4317 and 4318 belong to the collector,
+not to Tempo. config/otel-collector-config.yaml already exports there, so the Service below
+publishes the same numbers and the exporter needs no edit.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "tempo") | nindent 4 }}
+spec:
+  ports:
+    - name: http
+      port: 3200
+      targetPort: http
+    - name: otlp-grpc
+      port: 14317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 14318
+      targetPort: otlp-http
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "tempo") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tempo
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "tempo") | nindent 4 }}
+spec:
+  serviceName: tempo
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "tempo") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-backends.yaml") . | sha256sum }}
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "tempo") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "lgtm.serviceAccountName" . }}
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Replaces the `init` busybox chown service in docker-compose.yml.
+        fsGroup: 10001
+      containers:
+        - name: tempo
+          image: {{ .Values.images.tempo }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["-config.file=/etc/tempo/config.yaml"]
+          env:
+            {{- include "lgtm.s3Env" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3200
+            - name: otlp-grpc
+              containerPort: 14317
+            - name: otlp-http
+              containerPort: 14318
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.tempo.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tempo
+            - name: data
+              mountPath: /var/tempo
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.tempo.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.tempo.persistence.size }}

@@ -1,0 +1,66 @@
+{{/*
+Grafana provisioning.
+
+GRAFANA PROVISIONING FAILS SILENTLY. A malformed datasource file is skipped at startup and
+Grafana reports itself healthy with no datasources at all. There is no runtime signal. The
+repository already gates this in .github/workflows/config-check.yml, and the same files are
+loaded here without an edit - datasources.yaml addresses http://loki:3100 and friends, and
+those names resolve to the Services in this chart.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 4 }}
+data:
+  datasources.yaml: |
+    {{- .Files.Get "files/grafana/provisioning/datasources/datasources.yaml" | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 4 }}
+data:
+  dashboards.yaml: |
+    {{- .Files.Get "files/grafana/provisioning/dashboards/dashboards.yaml" | nindent 4 }}
+{{/*
+ONE CONFIGMAP PER DASHBOARD FOLDER, matching the three providers in dashboards.yaml. Each
+mounts at the exact `options.path` that provider names, so the provider file needs no edit.
+
+A ConfigMap is capped at roughly 1 MiB. These three hold about 185 KB in total today, so
+the cap is not near - but a folder that grows past it needs splitting, not compressing.
+*/}}
+{{- range $folder := (list "demo-service" "lgtm-health" "services") }}
+{{- $glob := $.Files.Glob (printf "files/grafana/provisioning/dashboards/%s/*.json" $folder) }}
+{{- if not $glob }}
+{{- fail (printf "no dashboards found for folder %s. Run `make -C k8s sync-config`." $folder) }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-{{ $folder }}
+  labels:
+    {{- include "lgtm.labels" $ | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 4 }}
+data:
+  {{- ($glob.AsConfig) | nindent 2 }}
+{{- end }}
+{{- if .Values.grafana.init.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-users-config
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 4 }}
+data:
+  users-config.json: |
+    {{- .Files.Get "files/grafana/users-config.json" | nindent 4 }}
+{{- end }}

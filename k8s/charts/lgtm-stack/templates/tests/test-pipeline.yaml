@@ -1,0 +1,81 @@
+{{/*
+`helm test lgtm -n lgtm`
+
+WHAT THIS ASSERTS, AND WHY IT IS A WRITE AND A READ. A readiness probe proves a process
+answers. It does not prove that a metric sent to the collector survives the pipeline and
+comes back out of Mimir. This test sends real OTLP through the front door and then queries
+the far end for it. Anything less would go green with the exporters misconfigured.
+
+IT USES METRICS, NOT TRACES, ON PURPOSE. tail_sampling drops most ordinary traces by
+design, so a trace-based assertion would be flaky in exactly the way that trains a reader
+to ignore a red test. Metrics are not sampled.
+
+IT REUSES scripts/send-test-metrics.sh rather than carrying its own payload. A private copy
+of the payload would drift from the script the repository already ships.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ .Release.Name }}-test-pipeline"
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: {{ .Values.images.initTools }}
+      imagePullPolicy: {{ .Values.images.pullPolicy }}
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          echo "== 1. every component answers its ready endpoint =="
+          for url in \
+            http://loki:3100/ready \
+            http://tempo:3200/ready \
+            http://mimir:9009/ready \
+            http://grafana:3000/api/health \
+            http://otel-collector:13133/ ; do
+            for i in $(seq 1 30); do
+              if curl -sf "$url" >/dev/null; then echo "  OK  $url"; break; fi
+              if [ "$i" = "30" ]; then echo "  FAIL $url"; exit 1; fi
+              sleep 5
+            done
+          done
+
+          echo "== 2. send OTLP metrics through the collector =="
+          /scripts/send-test-metrics.sh --endpoint http://otel-collector:4318 2
+
+          echo "== 3. read them back out of Mimir =="
+          # The collector batches, and Mimir needs a moment to make the sample queryable.
+          # A single immediate query would fail for timing, not for correctness.
+          q='http_requests_total{service_name="test-metric-generator"}'
+          for i in $(seq 1 24); do
+            n=$(curl -sf -H 'X-Scope-OrgID: demo' \
+                  --data-urlencode "query=$q" \
+                  http://mimir:9009/prometheus/api/v1/query \
+                | jq '.data.result | length')
+            if [ "$n" -gt 0 ]; then
+              echo "  OK  Mimir returned $n series for the test metric"
+              exit 0
+            fi
+            echo "  waiting for the sample to become queryable ($i/24)"
+            sleep 5
+          done
+          echo "  FAIL the metric was accepted by the collector and never appeared in Mimir."
+          echo "  Look at the collector's exporter errors first: kubectl logs sts/otel-collector"
+          exit 1
+      volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+  volumes:
+    - name: scripts
+      configMap:
+        name: lgtm-scripts
+        defaultMode: 0755

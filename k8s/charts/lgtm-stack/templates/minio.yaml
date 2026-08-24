@@ -1,0 +1,152 @@
+{{- if .Values.minio.enabled }}
+{{/*
+MinIO: an S3 server inside the cluster.
+
+WHY THIS EXISTS RATHER THAN A FILESYSTEM BACKEND. config/tempo-config.yaml and
+config/mimir-config.yaml already say `backend: s3`. Switching them to a local directory for
+the cluster would mean the S3 code path - credentials, bucket lookup, retries, compaction
+uploads - is never exercised until it runs on AWS for the first time. MinIO keeps that path
+live locally and reduces the AWS change to three values: endpoint, bucket, and two flags.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 4 }}
+spec:
+  ports:
+    - name: api
+      port: 9000
+      targetPort: api
+    - name: console
+      port: 9001
+      targetPort: console
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 4 }}
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        # fsGroup CHOWNS THE MOUNTED VOLUME. This one line replaces the `init` busybox
+        # services in docker-compose.yml, which exist only because a fresh Docker named
+        # volume is root-owned and the distroless images have no shell to chown it with.
+        fsGroup: 1000
+      containers:
+        - name: minio
+          image: {{ .Values.images.minio }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootUser }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootPassword }
+          ports:
+            - name: api
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: api }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /minio/health/live, port: api }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.minio.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.minio.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.minio.persistence.size }}
+---
+{{/*
+Bucket creation, as a Helm hook.
+
+A HOOK, NOT A PLAIN JOB. A Job's pod template is immutable, so a plain Job in the chart
+makes the second `helm upgrade` fail. The hook is deleted and recreated on every release,
+which is what "run this again" means here.
+
+The wait loop is not defensive padding. Helm's post-install hook fires once the objects are
+CREATED, not once MinIO answers, so the first `mc alias set` normally races the server.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-make-buckets
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio-make-buckets") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: {{ .Values.images.mc }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootUser }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootPassword }
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              for i in $(seq 1 60); do
+                if mc alias set lgtm http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; then
+                  break
+                fi
+                echo "minio not ready yet (attempt $i); retrying in 5s"
+                sleep 5
+              done
+              {{- range .Values.minio.buckets }}
+              mc mb --ignore-existing lgtm/{{ . }}
+              {{- end }}
+              mc ls lgtm
+{{- end }}
