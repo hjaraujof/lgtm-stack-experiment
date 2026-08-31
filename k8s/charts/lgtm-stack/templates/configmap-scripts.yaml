@@ -1,0 +1,24 @@
+{{/*
+The two init scripts, mounted rather than baked into an image.
+
+WHY NOT BAKE THEM IN. docker-compose.yml bind-mounts these scripts into a container built
+only for its toolchain (bash, curl, jq). Baking them into the image here would make every
+script edit a rebuild and a push, and would let the running script drift from scripts/ with
+nothing to show the difference. A ConfigMap keeps the same split: the image supplies the
+tools, this supplies the code.
+
+The scripts are a synced copy of scripts/. `make -C k8s sync-config` refreshes it and CI
+fails on drift.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lgtm-scripts
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+data:
+  {{- $scripts := .Files.Glob "scripts/*.sh" }}
+  {{- if not $scripts }}
+  {{- fail "no scripts found in the chart. Run `make -C k8s sync-config`." }}
+  {{- end }}
+  {{- ($scripts.AsConfig) | nindent 2 }}

@@ -1,0 +1,136 @@
+# EKS overlay.
+#
+#   helm install lgtm k8s/charts/lgtm-stack -n lgtm --create-namespace \
+#     -f k8s/charts/lgtm-stack/values-eks.yaml \
+#     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<role arn from tofu output>
+#
+# EVERY PLACEHOLDER BELOW IS A PLACEHOLDER. Set your own account, region, buckets, domain
+# and issuer before installing anything. The repository is org-agnostic on purpose.
+
+# ==========================================================================================
+# NO MINIO, AND NO KEY ANYWHERE
+# ==========================================================================================
+minio:
+  enabled: false
+
+s3Credentials:
+  # NO VARIABLE IS INJECTED, AND THAT IS THE POINT. With enabled=false the pods get no
+  # AWS_ACCESS_KEY_ID at all. AWS projects a token into every pod that uses the annotated
+  # ServiceAccount, and the same AWS credential chain in Tempo and Mimir finds that token
+  # instead of a key. No static credential exists to leak, and none has to be rotated.
+  enabled: false
+
+# The password is read straight from AWS Secrets Manager and mounted as a FILE. No
+# Kubernetes Secret is created, so nothing lands in etcd and `kubectl get secret` in this
+# namespace returns nothing worth stealing.
+#
+# THE PATH IS THE SAME PATH user_data.tpl READS AT BOOT. One rotation in Secrets Manager
+# therefore reaches both deployment planes.
+secretsStore:
+  enabled: true
+  remoteSecret: /example/dev/lgtm-stack
+
+serviceAccount:
+  create: true
+  # THE ONE ANNOTATION THAT REMOVES EVERY AWS CREDENTIAL FROM THIS CLUSTER. Uncomment the
+  # line that matches the mechanism you chose in terraform/eks (var.use_pod_identity):
+  #
+  #   EKS Pod Identity - AWS's current recommendation for a new EKS cluster. The
+  #   association lives in AWS, so NO annotation is needed here at all. Leave this empty.
+  #
+  #   IRSA - the portable one. It works with any OIDC provider, across accounts, and
+  #   outside EKS. It needs the annotation:
+  #     eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/lgtm-irsa
+  #
+  # Take the value from `tofu -chdir=terraform/eks output lgtm_role_arn`.
+  annotations: {}
+
+# ==========================================================================================
+# REAL S3
+# ==========================================================================================
+# USE DIFFERENT BUCKETS FROM THE EC2 DEPLOYMENT. Two Mimir instances that share a bucket AND
+# a storage prefix do not fail politely: they interleave block uploads and compaction over
+# each other's data. The same applies to Tempo. terraform/eks/ therefore creates its own
+# pair of buckets rather than reusing the ones in s3-backends.tf.
+#
+# gp3 comes through the EBS CSI driver. WITHOUT THAT DRIVER INSTALLED, every
+# volumeClaimTemplate in this chart stays Pending forever and every pod stays Pending with
+# it - with no error on the pod, only on the PersistentVolumeClaim. Check there first.
+tempo:
+  persistence: { storageClass: gp3, size: 50Gi }
+  configOverride:
+    storage:
+      trace:
+        s3:
+          bucket: lgtm-eks-traces-us-east-1-123456789012
+          endpoint: s3.us-east-1.amazonaws.com
+          region: us-east-1
+          insecure: false
+          forcepathstyle: false
+
+mimir:
+  persistence: { storageClass: gp3, size: 100Gi }
+  configOverride:
+    common:
+      storage:
+        s3:
+          endpoint: s3.us-east-1.amazonaws.com
+          region: us-east-1
+          bucket_name: lgtm-eks-metrics-us-east-1-123456789012
+          insecure: false
+          bucket_lookup_type: auto
+    alertmanager_storage:
+      s3:
+        endpoint: s3.us-east-1.amazonaws.com
+        region: us-east-1
+        bucket_name: lgtm-eks-metrics-us-east-1-123456789012
+        insecure: false
+        bucket_lookup_type: auto
+
+loki:
+  persistence: { storageClass: gp3, size: 100Gi }
+
+grafana:
+  persistence: { storageClass: gp3, size: 10Gi }
+  # SSO IS THE REAL TARGET. A Grafana admin password exists only because a login form
+  # exists. Point Grafana at IAM Identity Center, set disableLoginForm true, and the
+  # credential is gone - nothing to store, mount or rotate. The built-in admin then survives
+  # as break-glass only, still reachable through the CSI mount above.
+  #
+  # Fill these in, install, log in ONCE through SSO, and only then set disableLoginForm.
+  auth:
+    oauth:
+      enabled: false
+      name: SSO
+      clientId: ""
+      authUrl: ""
+      tokenUrl: ""
+      apiUrl: ""
+      disableLoginForm: false
+
+collector:
+  queue: { storageClass: gp3, size: 20Gi }
+
+# ==========================================================================================
+# INGRESS
+# ==========================================================================================
+ingress:
+  host: grafana.example.com
+  className: nginx
+  tls:
+    enabled: true
+    secretName: grafana-tls
+    clusterIssuer: letsencrypt-prod
+    # The Let's Encrypt issuer holds an ACME account and is a cluster-wide object. It
+    # belongs to whoever installs cert-manager, not to this release, so this release does
+    # not create or delete it.
+    createIssuer: false
+
+# OTLP for producers outside the cluster. An INTERNAL load balancer, not a public one: the
+# EC2 deployment reaches the collector only from inside the VPC, and this keeps that true.
+# A public OTLP endpoint with no authentication accepts telemetry from anyone.
+otlpService:
+  type: LoadBalancer
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb

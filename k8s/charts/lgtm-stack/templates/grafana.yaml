@@ -1,0 +1,264 @@
+{{/*
+Grafana.
+
+A STATEFULSET FOR ONE REPLICA. Grafana keeps its own SQLite database under
+/var/lib/grafana: dashboards edited in the UI, users, API keys, annotations. Two replicas
+against one ReadWriteOnce volume is not a way to scale it - it is two processes writing one
+SQLite file. Scaling Grafana properly means moving that database to Postgres or MySQL and
+only then running a Deployment with several replicas.
+
+THE PASSWORD IS A FILE, NOT A VALUE, IN BOTH PLANES. Every GF_ variable accepts a __FILE
+suffix that names a path instead of carrying the secret. Only the SOURCE of that file
+differs - a Secret volume locally, a Secrets Store CSI mount on EKS - so the local cluster
+exercises the real mechanism rather than a simplified stand-in. On EKS no Kubernetes Secret
+exists at all: the CSI driver reads AWS Secrets Manager with the pod's own AWS identity, and
+nothing lands in etcd for `kubectl get secret` to return.
+
+THE PROVISIONING MOUNTS ARE FOUR SEPARATE VOLUMES, and the shape is deliberate. The
+provider file dashboards.yaml names three directories by absolute path. Each of those
+directories is its own ConfigMap mounted at exactly that path, so the provider file needs
+no edit between the two planes.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 4 }}
+spec:
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: grafana
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 4 }}
+spec:
+  serviceName: grafana
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-grafana.yaml") . | sha256sum }}
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "lgtm.serviceAccountName" . }}
+      securityContext:
+        # 472 is Grafana's own UID, not an arbitrary number.
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: {{ .Values.images.grafana }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: {{ .Values.grafana.adminUser | quote }}
+            # __FILE, not a value. See the header comment.
+            - name: GF_SECURITY_ADMIN_PASSWORD__FILE
+              value: /etc/grafana/secrets/admin-password
+            - name: GF_SERVER_ROOT_URL
+              value: {{ .Values.grafana.rootUrl | default (printf "https://%s" .Values.ingress.host) | quote }}
+            - name: GF_SERVER_DOMAIN
+              value: {{ .Values.ingress.host | quote }}
+            {{- if .Values.grafana.auth.oauth.enabled }}
+            # SSO. Once this works, the admin password is break-glass only.
+            - name: GF_AUTH_GENERIC_OAUTH_ENABLED
+              value: "true"
+            - name: GF_AUTH_GENERIC_OAUTH_NAME
+              value: {{ .Values.grafana.auth.oauth.name | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_CLIENT_ID
+              value: {{ .Values.grafana.auth.oauth.clientId | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET__FILE
+              value: /etc/grafana/secrets/oauth-client-secret
+            - name: GF_AUTH_GENERIC_OAUTH_AUTH_URL
+              value: {{ .Values.grafana.auth.oauth.authUrl | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_TOKEN_URL
+              value: {{ .Values.grafana.auth.oauth.tokenUrl | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_API_URL
+              value: {{ .Values.grafana.auth.oauth.apiUrl | quote }}
+            - name: GF_AUTH_GENERIC_OAUTH_SCOPES
+              value: {{ .Values.grafana.auth.oauth.scopes | quote }}
+            # SET THIS TRUE ONLY AFTER A SUCCESSFUL SSO LOGIN. Disabling the form before the
+            # provider works locks every human out of a Grafana whose admin account is then
+            # reachable only by editing this value and rolling the pod.
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: {{ .Values.grafana.auth.oauth.disableLoginForm | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.grafana.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: credentials
+              mountPath: /etc/grafana/secrets
+              readOnly: true
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
+              subPath: dashboards.yaml
+            {{- range $folder := (list "demo-service" "lgtm-health" "services") }}
+            - name: dashboards-{{ $folder }}
+              mountPath: /etc/grafana/provisioning/dashboards/{{ $folder }}
+            {{- end }}
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        {{- range $folder := (list "demo-service" "lgtm-health" "services") }}
+        - name: dashboards-{{ $folder }}
+          configMap:
+            name: grafana-dashboards-{{ $folder }}
+        {{- end }}
+        {{- include "lgtm.credentialsVolume" . | nindent 8 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.grafana.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.grafana.persistence.size }}
+{{- if .Values.grafana.init.enabled }}
+---
+{{/*
+User and team provisioning, as a post-install hook.
+
+A HOOK, NOT A SIDECAR AND NOT A PLAIN JOB. It must run after Grafana answers its API, once
+per release, and it must be re-runnable - which is a Helm hook exactly. The script is
+already idempotent, so a repeat leaves existing users untouched.
+
+IT IS REDUNDANT UNDER SSO, and that is the better end state. An identity provider that
+already knows your engineers should create them; a JSON file in this repository should not.
+
+NO AWS CLIENT IS INVOLVED. In Compose this container mounts ~/.aws so the script can fall
+back to Secrets Manager. Here the passwords arrive as FILES on the same credentials volume
+Grafana uses, so the fallback never triggers. Reading them in the command below keeps each
+value inside the process: it never appears in the pod spec, where `kubectl describe pod`
+would print it.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grafana-init
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "grafana-init") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "lgtm.serviceAccountName" . }}
+      containers:
+        - name: grafana-init
+          image: {{ .Values.images.initTools }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              GRAFANA_ADMIN_PASSWORD=$(cat /etc/grafana/secrets/admin-password)
+              DEFAULT_ADMIN_PASSWORD=$(cat /etc/grafana/secrets/default-admin-password)
+              DEFAULT_MEMBER_PASSWORD=$(cat /etc/grafana/secrets/default-member-password)
+              export GRAFANA_ADMIN_PASSWORD DEFAULT_ADMIN_PASSWORD DEFAULT_MEMBER_PASSWORD
+              exec /bin/bash /scripts/init-grafana.sh
+          env:
+            - name: GRAFANA_URL
+              value: http://grafana:3000
+            - name: CONFIG_FILE
+              value: /config/users-config.json
+          volumeMounts:
+            - name: credentials
+              mountPath: /etc/grafana/secrets
+              readOnly: true
+            - name: users-config
+              mountPath: /config
+              readOnly: true
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: users-config
+          configMap:
+            name: grafana-users-config
+        - name: scripts
+          configMap:
+            name: lgtm-scripts
+            defaultMode: 0755
+        {{- include "lgtm.credentialsVolume" . | nindent 8 }}
+{{- end }}
+{{- if .Values.secretsStore.enabled }}
+---
+{{/*
+The Secrets Store CSI driver's instruction sheet.
+
+IT READS AWS SECRETS MANAGER WITH THE POD'S OWN AWS IDENTITY - the ServiceAccount annotated
+for EKS Pod Identity or for IRSA. No key exists anywhere in the cluster, and there is
+nothing to rotate here: rotating the value in Secrets Manager IS the whole operation.
+
+NOTE WHAT IS ABSENT. There is no `secretObjects:` block. Adding one would ALSO create an
+ordinary Kubernetes Secret, which puts the password back into etcd and back within reach of
+anyone holding `get secrets` in this namespace. The files are enough, because Grafana reads
+files.
+*/}}
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: grafana-credentials
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: {{ .Values.secretsStore.remoteSecret | quote }}
+        objectType: secretsmanager
+        jmesPath:
+          - path: {{ .Values.secretsStore.keys.adminPassword | quote }}
+            objectAlias: admin-password
+          - path: {{ .Values.secretsStore.keys.defaultAdminPassword | quote }}
+            objectAlias: default-admin-password
+          - path: {{ .Values.secretsStore.keys.defaultMemberPassword | quote }}
+            objectAlias: default-member-password
+{{- end }}

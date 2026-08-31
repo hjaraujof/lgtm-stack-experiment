@@ -1,0 +1,163 @@
+{{- if .Values.minio.enabled }}
+{{/*
+MinIO: an S3 server inside the cluster.
+
+WHY THIS EXISTS RATHER THAN A FILESYSTEM BACKEND. config/tempo-config.yaml and
+config/mimir-config.yaml already say `backend: s3`. Switching them to a local directory for
+the cluster would mean the S3 code path - credentials, bucket lookup, retries, compaction
+uploads - is never exercised until it runs on AWS for the first time. MinIO keeps that path
+live locally and reduces the AWS change to three values: endpoint, bucket, and two flags.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 4 }}
+spec:
+  ports:
+    - name: api
+      port: 9000
+      targetPort: api
+    - name: console
+      port: 9001
+      targetPort: console
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 4 }}
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        # fsGroup CHOWNS THE MOUNTED VOLUME. This one line replaces the `init` busybox
+        # services in docker-compose.yml, which exist only because a fresh Docker named
+        # volume is root-owned and the distroless images have no shell to chown it with.
+        fsGroup: 1000
+      containers:
+        - name: minio
+          image: {{ .Values.images.minio }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootUser }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootPassword }
+          ports:
+            - name: api
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: api }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /minio/health/live, port: api }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.minio.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.minio.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.minio.persistence.size }}
+---
+{{/*
+Bucket creation.
+
+NOT A HELM HOOK, AND THE REASON IS A DEADLOCK THAT WAS REAL. This started as a
+post-install hook, which reads well and cannot work:
+
+  `helm install --wait` waits for every workload to become READY, and only THEN runs
+  the post-install hooks. Tempo cannot become ready without its bucket. So the install
+  waited ten minutes for a Tempo that was crash-looping on
+  `unexpected error from ListObjects on lgtm-traces: The specified bucket does not
+  exist`, timed out, and the hook that would have created the bucket never ran at all.
+
+A pre-install hook fails the other way: it would run before MinIO exists.
+
+So this is an ordinary Job in the main phase. It starts alongside MinIO, and the retry
+loop below covers the gap until the server answers. Tempo and Mimir crash-loop for a
+minute meanwhile, which looks alarming and is correct Kubernetes behaviour - a pod that
+cannot reach a dependency restarts until it can.
+
+THE NAME CARRIES THE REVISION because a Job's pod template is immutable. A fixed name
+makes the second `helm upgrade` fail with `field is immutable`. One Job per revision
+avoids that, at the cost of leaving completed Jobs behind; ttlSecondsAfterFinished
+clears them.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-make-buckets-{{ .Release.Revision }}
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "minio-make-buckets") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: {{ .Values.images.mc }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootUser }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.minio.credentialsSecret }}, key: rootPassword }
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              for i in $(seq 1 60); do
+                if mc alias set lgtm http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; then
+                  break
+                fi
+                echo "minio not ready yet (attempt $i); retrying in 5s"
+                sleep 5
+              done
+              {{- range .Values.minio.buckets }}
+              mc mb --ignore-existing lgtm/{{ . }}
+              {{- end }}
+              mc ls lgtm
+{{- end }}

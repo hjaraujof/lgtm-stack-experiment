@@ -1,0 +1,173 @@
+# Basic Mimir configuration for local Docker Compose (monolithic mode)
+
+target: all # Run all components in a single process (monolithic mode)
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+
+# S3 object storage backend (credential-less: uses the EC2 IAM instance role via the
+# VPC's free S3 gateway endpoint). common.storage applies backend+endpoint+region to
+# blocks/ruler/alertmanager; each gets a distinct storage_prefix in the shared metrics
+# bucket (Mimir refuses to start if two stores share bucket+prefix).
+common:
+  storage:
+    backend: s3
+    s3:
+      endpoint: s3.us-east-1.amazonaws.com   # host only, no bucket prefix, no scheme
+      region: us-east-1
+      bucket_name: lgtm-metrics-us-east-1-123456789012
+      # access_key_id/secret_access_key intentionally unset -> IAM instance role
+
+blocks_storage:
+  storage_prefix: blocks
+  tsdb:
+    dir: /tmp/mimir/tsdb          # local TSDB head/WAL stays on EBS
+    retention_period: 336h        # 14 days retention
+
+distributor:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+ingester:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+    replication_factor: 1
+    min_ready_duration: 0s
+
+# Limits Configuration
+limits:
+  # Raised from 10000/20000: the otel-collector spanmetrics+servicegraph connectors now generate
+  # RED/service-graph metrics on the FULL (unsampled) trace stream, which exceeded the old 10k
+  # samples/s limit (err-mimir-tenant-max-ingestion-rate, 41k+ samples dropped). 30k/60k gives
+  # headroom; Mimir is near-idle on this box. Revisit if source instrumentation volume drops.
+  #
+  # IT IS THE BURST THAT BINDS, NOT THE RATE. Both terms share ONE token bucket, so Mimir reports
+  # `err-mimir-tenant-max-ingestion-rate` for either. That error string makes every incident read as
+  # a rate problem, and for this stack it usually is not one.
+  #
+  # The arithmetic: the spanmetrics connector ships its ENTIRE cache as ONE write every
+  # metrics_flush_interval. Sustained ingestion can sit at a few percent of ingestion_rate while a
+  # single flush asks for more samples than ingestion_burst_size allows. Acceptance then clamps at
+  # (burst + tokens refilled during the flush), and the excess is rejected. RAISING ingestion_rate
+  # CHANGES NOTHING in that state.
+  #
+  # To check which one binds, compare one flush payload against the burst:
+  #   count(traces_span_metrics_calls_total) * (histogram_buckets + 3)
+  # SpanMetricsFlushApproachingBurstLimit in stack-alerts.yaml alerts on exactly that, at 70%.
+  ingestion_rate: 30000
+  # A LARGER BURST IS A STOPGAP, NOT A FIX. No finite burst survives monotonic growth, and the flush
+  # payload grows monotonically whenever the spanmetrics cache is unbounded — every span name ever
+  # seen is re-flushed every interval. The durable fixes are `metrics_expiration` and bounding
+  # unbounded span names, both in config/otel-collector-config.yaml. This only stops the bleeding.
+  #
+  # KNOWN INCOHERENCE, worth stating rather than hiding: a whole-cache flush carries every cached
+  # series, so this burst rejects at roughly 200k series while MimirActiveSeriesHigh fires at 400k.
+  # The series alert therefore still cannot fire before the burst rejects. It is the same class of
+  # bug that max_global_series_per_user below was added to fix, one limit over.
+  ingestion_burst_size: 200000
+  # Phase B: enable exemplar STORAGE (default 0 = disabled). Exemplars are emitted by the collector
+  # spanmetrics connector (exemplars.enabled:true) and forwarded by prometheusremotewrite (send_exemplars
+  # defaults true in 0.142.0) - they were being dropped here for lack of storage. 100k is a per-tenant
+  # ring (not per-series). Exemplars ride existing series so no new-series ingestion-rate pressure.
+  # NOTE: exemplars for qa traces may 404 on click (tail-sampled out); dev/prod (100% kept) resolve.
+  max_global_exemplars_per_user: 100000
+  max_label_names_per_series: 20
+  max_label_value_length: 512
+  max_label_name_length: 256
+  # MAKE THE ACTIVE-SERIES CAP EXPLICIT, and keep it in step with the alert.
+  #
+  # Mimir's default is 150k per tenant. An alert threshold set ABOVE an implicit default silently
+  # contradicts it: discards begin at the default while the alert waits for a number it can never
+  # reach. State the cap here, and set MimirActiveSeriesHigh in stack-alerts.yaml to 80% of it, so
+  # the warning arrives BEFORE discards start.
+  max_global_series_per_user: 500000
+  # Object-store (compactor-managed) block retention. Previously UNSET, which left object-store
+  # retention governed only by a bucket lifecycle rule — a backstop in a different system, easy to
+  # forget. blocks_storage.tsdb.retention_period above is the INGESTER-LOCAL disk knob and a
+  # separate concern; do not confuse the two.
+  compactor_blocks_retention_period: 336h   # 14 days, matches the intended metrics retention
+  # Enable the cardinality-analysis API endpoints. Costs nothing at steady state, because the
+  # endpoints only do work when queried. docs/runbooks/mimir-cardinality.md instructs responders to
+  # investigate through this API, so leaving it disabled makes that runbook step impossible.
+  cardinality_analysis_enabled: true
+
+# Alertmanager
+alertmanager:
+  data_dir: /tmp/mimir/alertmanager
+  external_url: http://localhost:9009/alertmanager
+  enable_api: true                     # allow POSTing tenant AM config via /api/v1/alerts
+
+# Alertmanager config storage - object storage with a DISTINCT prefix (Mimir refuses to start if two
+# stores share bucket+prefix with blocks_storage=blocks; this is the startup-collision guard).
+#
+# DELIBERATELY NOT the read-only `local` backend that ruler_storage uses below. The Alertmanager
+# persists its OWN state here — silences and the notification log — and a read-only backend would
+# lose both. scripts/init-mimir-alertmanager.sh is what makes git the deploy for the CONFIG, without
+# giving up that state.
+alertmanager_storage:
+  backend: s3
+  storage_prefix: alertmanager
+  s3:
+    endpoint: s3.us-east-1.amazonaws.com
+    region: us-east-1
+    bucket_name: lgtm-metrics-us-east-1-123456789012
+
+# Ruler
+ruler:
+  rule_path: /tmp/mimir/rules          # working/WAL dir (not the rule source - that's ruler_storage)
+  alertmanager_url: http://localhost:9009/alertmanager
+  enable_api: true                     # read endpoints only now; the local ruler_storage backend refuses writes
+  # Default is 10m. With rules deployed by `git pull` (see ruler_storage below), a 10m wait between
+  # pull and effect invites "did it deploy?" confusion, and then hand-loading — which is the drift
+  # this whole arrangement removes. 1m makes the deploy observable. The cost is a directory scan of
+  # a few small files per minute.
+  poll_interval: 1m
+  ring:
+    kvstore:
+      store: inmemory
+
+# Compactor
+compactor:
+  data_dir: /tmp/mimir/compactor
+
+# RULER STORAGE — the git-tracked rule files are the ONLY source of truth.
+#
+# THE TRAP THIS AVOIDS. The obvious choice is `backend: filesystem`, pointed at a directory inside a
+# named volume. That is the read-WRITE object-store-EMULATION backend: it stores each group
+# PROTOBUF-serialized under rules/<tenant>/<base64(namespace)>/<base64(group)>. It does NOT read your
+# YAML. So config/mimir/rules/ is never mounted anywhere, git and the live ruler become two
+# independent copies with nothing reconciling them, and every rule change needs a manual
+# `POST /prometheus/config/v1/rules/<namespace>` that is easy to forget SILENTLY.
+#
+# That drifts in BOTH directions. The box's git can sit several merges behind while the live ruler
+# serves rules loaded by hand weeks earlier, and nothing anywhere reports the mismatch.
+#
+# THE FIX. The `local` backend scans <directory>/<tenant>/<namespace> for plain Prometheus-format
+# YAML — which is exactly the shape config/mimir/rules/demo/*.yaml already has. `git pull` is the
+# deploy. The namespace IS the filename, so the namespaces here are red-recording.yaml,
+# slo-burn.yaml and stack-alerts.yaml. Group names are unchanged, and the Alertmanager routes on
+# labels, so that naming is cosmetic.
+#
+# THE TRADE-OFF, accepted deliberately: the local backend is READ-ONLY. Mimir's docs state it does
+# not support creation or deletion of rules through the configuration API, so emergency API
+# hot-loading is gone. The mitigation is better than what it replaces — because the directory is a
+# bind mount of the repo, an urgent edit on the box modifies a GIT-TRACKED file and shows up in
+# `git status`. INVISIBLE DRIFT BECOMES VISIBLE DRIFT. `enable_api` stays true above: read endpoints
+# (/prometheus/api/v1/rules) still work, and only writes are refused.
+#
+# BEFORE YOU CUT OVER an existing stack, diff CANONICALIZED rules, not raw text. Compare group name,
+# rule name, `for`, and the parsed expression. Mimir re-serializes numbers (1e-9 becomes
+# 0.000000001, 0.50 becomes 0.5), so a raw text diff reports mismatches that are not real. The old
+# protobuf namespaces can be left in place as a rollback artifact: flipping back to `filesystem`
+# restores them as they were.
+#
+# The matching read-only bind mount is in docker-compose.yml. `:ro` there is deliberate.
+ruler_storage:
+  backend: local
+  local:
+    directory: /etc/mimir/rules

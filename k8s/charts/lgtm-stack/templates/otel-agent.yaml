@@ -1,0 +1,79 @@
+{{- if .Values.collector.agent.enabled }}
+{{/*
+The host-metrics agent.
+
+A DAEMONSET IS THE ONE OBJECT WITH NO COMPOSE EQUIVALENT, and it is the clearest lesson in
+this chart. A DaemonSet runs exactly one pod on every node, and it schedules a new pod
+automatically when a node joins. Compose has no such idea, because Compose has one host.
+
+WHAT IT NEEDS THAT NOTHING ELSE HERE NEEDS.
+  hostPath / at /hostfs   the hostmetrics receiver reads the host through it, exactly as
+                          the `-v /:/hostfs:ro` bind mount does in Compose.
+  a node name in the env  three agents emitting identical label sets would be ONE series in
+                          Mimir receiving three conflicting samples. See the attributes/node
+                          processor in the agent config.
+  tolerations             without them the control-plane node runs no agent and its metrics
+                          are simply missing, with no error anywhere.
+
+IT HAS NO SERVICE. Nothing connects TO an agent; each agent pushes to Mimir. A Service with
+no consumer is a common reflex and it would be dead weight here.
+*/}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-agent
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-agent") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-agent") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-collector.yaml") . | sha256sum }}
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-agent") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "lgtm.serviceAccountName" . }}
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: collector
+          image: {{ .Values.images.collector }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["--config=/etc/otelcol-contrib/config.yaml"]
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: health
+              containerPort: 13133
+          readinessProbe:
+            httpGet: { path: /, port: health }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.collector.agent.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib
+            - name: hostfs
+              mountPath: /hostfs
+              readOnly: true
+              # The host's own mounts appear under /hostfs after the pod starts. Without
+              # HostToContainer the pod sees the mount points that existed at start only,
+              # so filesystem metrics for anything mounted later are silently absent.
+              mountPropagation: HostToContainer
+      volumes:
+        - name: config
+          configMap:
+            name: otel-agent-config
+        - name: hostfs
+          hostPath:
+            path: /
+{{- end }}

@@ -1,0 +1,12 @@
+# DO NOT ADD files/ OR scripts/ HERE.
+#
+# .helmignore controls what `helm package` puts in the archive. Both directories hold the
+# synced configs and scripts that the ConfigMap templates read with .Files.Get. Excluding
+# either one produces a chart that lints, templates, packages and then fails at install
+# with an empty ConfigMap - the templates carry an explicit `fail` for exactly that.
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+*.swp
+*.bak

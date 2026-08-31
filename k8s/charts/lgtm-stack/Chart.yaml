@@ -1,0 +1,19 @@
+apiVersion: v2
+name: lgtm-stack
+description: >-
+  Loki, Grafana, Tempo, Mimir and an OpenTelemetry Collector, written as plain
+  Kubernetes objects. The same config files that docker-compose.yml mounts are loaded
+  here into ConfigMaps, so one set of configs serves both deployment planes.
+type: application
+
+# The chart's own version. Bump it when a template changes.
+version: 0.1.0
+
+# The version of the stack this chart deploys. Keep it in step with the image tags in
+# values.yaml AND with docker-compose.yml. Two planes running different builds of the
+# same config is the drift this repository exists to avoid.
+appVersion: "1.0.0"
+
+# NO DEPENDENCIES ON PURPOSE. MinIO, Loki, Tempo, Mimir and Grafana all have upstream
+# charts, and using them would be the production choice. This chart writes every object
+# by hand instead, because the object is the thing being learned. See k8s/README.md.

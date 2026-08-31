@@ -1,0 +1,143 @@
+# Basic Tempo configuration for local Docker Compose setup
+
+server:
+  http_listen_port: 3200
+  # log_level: debug # Uncomment for verbose logging
+
+distributor:
+  # Raised from Tempo's 2048 default.
+  #
+  # WHY THIS MATTERS MORE THAN IT LOOKS. Instrumentation that attaches diagnostic payloads as span
+  # attributes — a document, a validation report — is often written on the reasoning that "the full
+  # payload lives on the trace, where it can be arbitrarily large". That reasoning is WRONG against
+  # a default Tempo. It clips the attribute and logs:
+  #   msg="attributes truncated" max_size_bytes=2048 example_name=... example_orig_size=8773
+  # A cut lands MID-JSON, so what survives is unparseable — strictly worse than a deliberate
+  # truncation, and it defeats the whole point of routing the payload to the trace instead of a log.
+  #
+  # BOTH SIDES MUST AGREE. Cap the payload in the emitting application AND set this limit to match,
+  # so Tempo never truncates and the stored value is always valid. Prefer bounding the payload over
+  # raising this without limit: these attributes ride on EVERY error span, and span size feeds
+  # max_bytes_per_trace — the limit a runaway trace hits first.
+  #
+  # CAVEAT: this limit is in BYTES, while an application-side cap is usually in CHARACTERS. They
+  # coincide for the ASCII-dominant JSON these payloads normally contain. A payload heavy in
+  # multi-byte characters can still be clipped here. If that shows up in the `attributes truncated`
+  # log, raise THIS, not the application cap.
+  max_attribute_bytes: 4096
+  # OTLP receivers for internal communication from OTel Collector
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:14317 # Internal OTLP gRPC (from OTel Collector)
+        http:
+          endpoint: 0.0.0.0:14318 # Internal OTLP HTTP (from OTel Collector)
+    # jaeger: # Optional: Uncomment to enable Jaeger receivers
+    #   protocols:
+    #     thrift_http: # Port 14268
+    # zipkin: # Optional: Uncomment to enable Zipkin receiver
+    #   protocols:
+    #     http: # Port 9411
+
+# TEMPO 3.x MIGRATION NOTES — two whole blocks are GONE, and both are hard startup failures if left.
+#
+#   `ingester:`   REMOVED. The ingester module no longer exists; the distributor writes to an
+#                 in-process live-store, and the block-building knobs are internal to it.
+#   `compactor:`  REMOVED. Compaction and retention moved under the internal backend-scheduler.
+#                 The old compactor.compaction.block_retention is relocated, NOT deleted — see the
+#                 backend_scheduler block below the storage section.
+#
+# Tempo 3.x REJECTS both fields at startup rather than ignoring them, which is the good outcome:
+# a silently-ignored retention setting would let blocks accumulate for months.
+
+storage:
+  trace:
+    backend: s3                        # Trace blocks stored in S3 (removes disk-full failure mode)
+    s3:
+      bucket: lgtm-traces-us-east-1-123456789012
+      endpoint: s3.us-east-1.amazonaws.com   # host-only, no scheme
+      region: us-east-1
+      # No access_key/secret_key: credentials auto-discovered from the EC2 IAM instance profile
+      # (lgtm-ec2-instance-role -> lgtm-s3-backends policy). Routes via the VPC's free S3 gateway endpoint.
+    local:
+      path: /var/tempo/blocks          # local scratch dir (Tempo keeps this even with backend: s3)
+    wal:
+      path: /var/tempo/wal             # write-ahead log stays on the local disk
+
+# TEMPO 3.x — BLOCK RETENTION. This was compactor.compaction.block_retention in 2.x.
+#
+# The nesting looks wrong and is not: `provider.compaction` is a CompactionConfig whose `.Compactor`
+# field is a CompactorConfig, and BOTH are yaml-tagged "compaction". The "work" level that appears in
+# the CLI flag path is only a flag prefix, not a YAML level. Confirm with `-config.verify=true`.
+#
+# THE DEFAULT IF UNSET IS 336h. So this MUST be set explicitly, or blocks silently retain for two
+# weeks when you meant three days — which is the disk-full track.
+backend_scheduler:
+  provider:
+    compaction:
+      compaction:
+        block_retention: 72h           # 3-day trace retention
+
+# --- Metrics Generator ---
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://mimir:9009/api/v1/push
+        send_exemplars: true
+        headers:
+          X-Scope-OrgID: demo
+  # TEMPO 3.x MIGRATION — `traces_storage:` and the `local_blocks:` processor were REMOVED. Both
+  # fields are rejected by 3.x. The local-blocks processor no longer exists: the in-process
+  # live-store serves recent TraceQL metrics, and RF1 blocks already flushed to object storage
+  # provide the historical read path, so TraceQL dashboards keep continuity across the upgrade.
+  #
+  # The service_graphs and span_metrics processor DEFINITIONS are dropped too. They were inert here
+  # anyway, because span-metrics and service-graphs are produced by the otel-collector CONNECTORS on
+  # the FULL pre-sample stream. The Tempo generator only ever saw the tail-sampled stream, so its
+  # output was a SAMPLE-BIASED DUPLICATE of the connectors'. Running both is not redundancy — it is
+  # two different answers to the same question, and the biased one is the wrong one.
+  #
+  # A GUARDRAIL IS LOST IN THIS MIGRATION, and it is worth naming rather than discovering later. The
+  # removed `local_blocks.max_live_traces` was an explicit live-trace tripwire. Its 3.x replacement
+  # is the per-tenant `max_traces_per_user` cap in the overrides block below, watched by
+  # TempoLiveTracesHigh. Verify that alert fires against a running 3.x instance before you rely on it.
+
+# --- Query Frontend ---
+query_frontend:
+  max_retries: 2
+  search:
+    max_duration: 0  # No limit on search duration
+  trace_by_id:
+    query_shards: 50
+
+# --- Overrides (Tempo 3.x SCOPED form) ---
+# 3.x REJECTS the legacy flat overrides shape at startup. Per-tenant limits now nest under
+# `defaults:`, grouped by concern. `metrics_generator_processors` is dropped entirely: its only entry
+# was local-blocks, which no longer exists as a processor.
+overrides:
+  defaults:
+    global:
+      # 20MB, up from the 5MB default. This is a PER-TRACE cap, not a rate or volume cap. Once a
+      # single trace crosses it, Tempo refuses EVERY subsequent batch for that trace — see
+      # docs/runbooks/tempo-trace-too-large.md. Raising it does not help a never-ending trace; it
+      # only moves the cliff further out and costs more storage and query memory before it hits.
+      max_bytes_per_trace: 20000000
+    ingestion:
+      # CONCURRENT-LIVE-TRACE cap, not a throughput cap:
+      #   live_traces ~= incoming_trace_rate x trace_lifetime
+      # so a firehose of short traces pins it as readily as a trickle of long ones, and the two need
+      # opposite fixes. When it is reached, the live-store discards new-trace spans with
+      # reason=live_traces_exceeded.
+      #
+      # KEEP TempoLiveTracesHigh IN LOCKSTEP. That alert is set to 80% of this number. If you raise
+      # the cap and leave the alert, it warns constantly at the healthy new baseline, and somebody
+      # silences the one signal that fires BEFORE data is lost.
+      max_traces_per_user: 40000
+
+# --- Auth ---
+auth_enabled: false # Keep auth disabled

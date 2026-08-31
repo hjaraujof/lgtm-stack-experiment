@@ -1,0 +1,103 @@
+{{/*
+THE COLLECTOR IS ONE CONTAINER IN COMPOSE AND TWO WORKLOADS HERE. This file builds both
+configs, and the split is the single most important difference between the two planes.
+
+WHY IT SPLITS. config/otel-collector-config.yaml runs a `hostmetrics` receiver that reads
+the host through a read-only /hostfs mount. On one EC2 box, one collector sees the one
+host and the answer is complete. In a cluster, a gateway pod runs on ONE node, so the same
+config would report one node's CPU and call it the cluster's. Host metrics need one agent
+on EVERY node, and "one pod per node" is a DaemonSet.
+
+WHAT SPLITS.
+  gateway (StatefulSet)  everything except the hostmetrics receiver and its pipeline.
+                         It receives OTLP, computes span metrics, tail-samples, exports.
+  agent (DaemonSet)      hostmetrics only, written out below. It is small enough to state
+                         in full, and stating it is clearer than deriving it.
+
+The gateway config is DERIVED, not copied: the real file is parsed and the two hostmetrics
+keys are removed. So an edit to config/otel-collector-config.yaml reaches the gateway
+automatically, and the only thing this template asserts is the absence of hostmetrics.
+*/}}
+{{- $cfg := .Files.Get "files/otel-collector-config.yaml" | fromYaml }}
+{{- if not (hasKey $cfg.receivers "hostmetrics") }}
+{{- fail "the collector config no longer defines a `hostmetrics` receiver. This template removes it for the gateway, so its absence means the split above is now a no-op. Re-read the comment and delete the removal if the receiver is genuinely gone." }}
+{{- end }}
+{{- if not (hasKey $cfg.service.pipelines "metrics/host") }}
+{{- fail "the collector config no longer defines a `metrics/host` pipeline. Same reason as above." }}
+{{- end }}
+{{- $_ := unset $cfg.receivers "hostmetrics" }}
+{{- $_ := unset $cfg.service.pipelines "metrics/host" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-collector") | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml $cfg | nindent 4 }}
+{{- if .Values.collector.agent.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-agent-config
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "otel-agent") | nindent 4 }}
+data:
+  config.yaml: |
+    # Host metrics, one agent per node. Written by hand rather than derived, because it
+    # shares nothing with the gateway pipeline except the exporter.
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    receivers:
+      hostmetrics:
+        collection_interval: 60s
+        root_path: /hostfs
+        scrapers:
+          cpu: {}
+          memory: {}
+          load: {}
+          filesystem: {}
+          network: {}
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 15
+      # WITHOUT THIS THE THREE AGENTS OVERWRITE EACH OTHER. Every node emits
+      # system_cpu_time with an identical label set, so in Mimir they are ONE series
+      # receiving three conflicting samples per scrape. The symptom is not an error: it is
+      # a CPU graph that jumps between nodes and out-of-order-sample discards. The node
+      # name makes each series distinct.
+      attributes/node:
+        actions:
+          - key: node
+            value: ${env:K8S_NODE_NAME}
+            action: upsert
+      batch: {}
+
+    exporters:
+      prometheusremotewrite/mimir:
+        endpoint: http://mimir:9009/api/v1/push
+        headers:
+          X-Scope-OrgID: "demo"
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        metrics/host:
+          receivers: [hostmetrics]
+          processors: [memory_limiter, attributes/node, batch]
+          exporters: [prometheusremotewrite/mimir]
+{{- end }}

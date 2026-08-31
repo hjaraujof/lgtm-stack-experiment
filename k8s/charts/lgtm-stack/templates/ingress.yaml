@@ -1,0 +1,83 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+The front door.
+
+WHAT THIS REPLACES. In docker-compose.yml, HTTPS for Grafana costs two long-lived services
+(nginx, certbot), five volumes, four scripts and a render-then-reload dance on the host,
+because a certificate has to be obtained, written somewhere both containers can see, and
+then signalled to nginx. All of that is one Ingress object and one annotation here.
+
+WHO DOES THE WORK. The Ingress is only a REQUEST. An ingress controller (ingress-nginx)
+has to be running and watching, or this object exists, validates, and routes nothing at
+all - the single most common first-time surprise. cert-manager watches the annotation
+below, obtains the certificate, and writes it into the Secret named in tls.secretName. The
+controller reloads by itself. Neither controller is installed by this chart; see
+k8s/README.md.
+
+TLS TERMINATES HERE, exactly as it terminates at nginx in Compose. The hop from the
+controller to Grafana is plain HTTP inside the cluster.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.tls.enabled }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer | quote }}
+    {{- end }}
+    # Grafana ships large JavaScript bundles. The Compose plane needed explicit
+    # proxy_buffer_size / proxy_buffers in config/nginx/grafana.conf.template, because the
+    # defaults truncated them and the browser reported ERR_HTTP2_PROTOCOL_ERROR - a failure
+    # that reads like a Grafana fault and is not one. The same defaults apply here, so the
+    # same override is set through the controller's annotations.
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+{{- end }}
+{{- if and .Values.ingress.enabled .Values.ingress.tls.enabled .Values.ingress.tls.createIssuer }}
+---
+{{/*
+A self-signed issuer, for a cluster with no public DNS.
+
+Let's Encrypt CANNOT issue for grafana.localtest.me on a laptop: the HTTP-01 challenge
+requires the ACME server to reach the host from the internet. So kind gets a self-signed
+certificate and the browser warning that comes with it, and EKS gets a real
+letsencrypt-prod issuer through values-eks.yaml. The Ingress object above is identical in
+both cases; only the issuer name differs.
+
+THIS OBJECT NEEDS cert-manager INSTALLED FIRST. ClusterIssuer is a CustomResourceDefinition
+that cert-manager registers. Without it the API server rejects this with "no matches for
+kind" - which is a missing controller, not a broken template.
+*/}}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.ingress.tls.clusterIssuer }}
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+{{- end }}

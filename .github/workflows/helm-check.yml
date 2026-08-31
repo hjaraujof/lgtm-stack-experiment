@@ -1,0 +1,250 @@
+# Validate the Kubernetes plane.
+#
+# WHY THIS EXISTS. config-check.yml validates the files in config/. It does NOT validate the
+# copies of those files inside the Helm chart, and it does not know that two of them are
+# TRANSFORMED on the way in: the Mimir and Tempo configs are re-emitted after a deep merge,
+# and the collector gateway config is the real file with two keys removed. A transform can
+# produce valid Kubernetes YAML and an invalid Loki config, and nothing else here would
+# notice.
+#
+# READ THIS BEFORE YOU ADD A VALIDATOR. The repository's rule is that EVERY validator is
+# paired with a positive control asserting it REJECTS a deliberately broken input. That is
+# not ceremony: several of these tools pass vacuously when used slightly wrong. `helm
+# template` on a chart whose files/ directory is empty renders an EMPTY ConfigMap and exits
+# 0. A backend validator pointed at an empty file also exits 0. Two green steps, nothing
+# checked.
+#
+# Image tags MUST track docker-compose.yml and k8s/charts/lgtm-stack/values.yaml. Validating
+# a different version than production runs is how a config passes CI and fails at boot.
+
+name: helm-check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "k8s/**"
+      - "terraform/**"
+      # The chart embeds these. An edit here that the chart copy has not picked up is
+      # exactly the drift the sync gate exists to catch, so it must trigger this job.
+      - "config/**"
+      - "scripts/**"
+      - ".github/workflows/helm-check.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "k8s/**"
+      - "terraform/**"
+      - "config/**"
+      - "scripts/**"
+
+permissions:
+  contents: read
+
+env:
+  LOKI_IMAGE: grafana/loki:3.7.3
+  TEMPO_IMAGE: grafana/tempo:3.0.2
+  MIMIR_IMAGE: grafana/mimir:3.1.2
+  COLLECTOR_IMAGE: otel/opentelemetry-collector-contrib:0.142.0
+  CHART: k8s/charts/lgtm-stack
+
+jobs:
+  # ---------------------------------------------------------------------------------------
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: the chart copy must match config/ and scripts/
+        # THE SINGLE MOST LIKELY DEFECT IN THIS DIRECTORY. Helm cannot read a file outside
+        # the chart, so config/ is copied in. A copy with no gate is a copy that drifts, and
+        # the drift is invisible: both files parse, both deploy, and the two planes quietly
+        # run different configs.
+        run: |
+          set -euo pipefail
+          make -C k8s sync-config
+          if ! git diff --quiet -- "$CHART/files" "$CHART/scripts"; then
+            echo "::error::the chart copy is stale. Run: make -C k8s sync-config"
+            git --no-pager diff --stat -- "$CHART/files" "$CHART/scripts"
+            exit 1
+          fi
+          echo "OK: chart copy matches config/ and scripts/"
+
+      - name: positive control - the sync gate must detect a real drift
+        # Without this, a gate whose diff path was mistyped would compare nothing and report
+        # green forever.
+        run: |
+          set -euo pipefail
+          echo "# __ci_drift_control__" >> config/loki-config.yaml
+          make -C k8s sync-config >/dev/null
+          if git diff --quiet -- "$CHART/files"; then
+            echo "::error::the sync gate did not see a one-line change to a synced file. \
+          Its diff path is wrong and the check above is vacuous."
+            exit 1
+          fi
+          git checkout -- config/loki-config.yaml
+          make -C k8s sync-config >/dev/null
+          echo "OK: the sync gate detects drift"
+
+      - name: helm lint, both overlays
+        run: |
+          set -euo pipefail
+          for v in values-kind values-eks; do
+            helm lint "$CHART" -f "$CHART/$v.yaml"
+            echo "OK: $v"
+          done
+
+      - name: render both overlays and check every object against the Kubernetes schema
+        run: |
+          set -euo pipefail
+          curl -sSfL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+          for v in values-kind values-eks; do
+            helm template lgtm "$CHART" -n lgtm -f "$CHART/$v.yaml" > "/tmp/$v.yaml"
+            # Non-empty and object-bearing. A chart that renders nothing passes every
+            # downstream check.
+            n=$(grep -c '^kind: ' "/tmp/$v.yaml" || true)
+            [ "$n" -ge 15 ] || { echo "::error::$v rendered only $n objects - something is disabled or broken"; exit 1; }
+            # -ignore-missing-schemas covers the two CustomResourceDefinitions (ClusterIssuer,
+            # SecretProviderClass) whose schemas are not in the public catalogue.
+            kubeconform -strict -summary -ignore-missing-schemas "/tmp/$v.yaml"
+            echo "OK: $v ($n objects)"
+          done
+
+      - name: positive control - kubeconform must reject a malformed object
+        run: |
+          set -euo pipefail
+          printf 'apiVersion: v1\nkind: Service\nmetadata:\n  name: x\nspec:\n  ports: "not-a-list"\n' > /tmp/bad.yaml
+          if kubeconform -strict /tmp/bad.yaml >/dev/null 2>&1; then
+            echo "::error::kubeconform accepted a Service whose ports is a string - the step \
+          above is not checking anything."
+            exit 1
+          fi
+          echo "OK: kubeconform rejects a malformed object"
+
+  # ---------------------------------------------------------------------------------------
+  rendered-configs:
+    # THE POINT OF THIS WHOLE WORKFLOW. `helm lint` checks the chart. It never asks whether
+    # the YAML inside a ConfigMap still loads. These are the bytes a pod will read.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: extract the rendered configs
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cfg
+          helm template lgtm "$CHART" -n lgtm -f "$CHART/values-kind.yaml" > /tmp/all.yaml
+          python3 k8s/scripts/extract-configs.py /tmp/all.yaml /tmp/cfg
+
+      - name: each backend validates its own RENDERED config
+        # The flags are NOT consistent across the Grafana stack, and each is easy to get
+        # wrong in a way that passes vacuously:
+        #   loki   -verify-config       a boolean
+        #   tempo  -config.verify=true  a VALUE flag. Bare `-config.verify` prints help, exit 0.
+        #   mimir  -modules             no verify flag exists; -modules loads and validates.
+        run: |
+          set -euo pipefail
+          docker run --rm -v /tmp/cfg/loki-config.yaml:/c.yaml:ro --entrypoint loki \
+            "$LOKI_IMAGE" -config.file=/c.yaml -verify-config
+          echo "OK: loki"
+          docker run --rm -v /tmp/cfg/mimir-config.yaml:/c.yaml:ro --entrypoint mimir \
+            "$MIMIR_IMAGE" -config.file=/c.yaml -modules >/dev/null
+          echo "OK: mimir"
+          docker run --rm -v /tmp/cfg/tempo-config.yaml:/c.yaml:ro --entrypoint /tempo \
+            "$TEMPO_IMAGE" -config.file=/c.yaml -config.verify=true
+          echo "OK: tempo"
+
+      - name: both collector configs construct every component
+        # -v /:/hostfs:ro is REQUIRED. `validate` instantiates receivers, and the agent's
+        # hostmetrics receiver sets root_path: /hostfs.
+        run: |
+          set -euo pipefail
+          docker run --rm -v /tmp/cfg/otel-collector-config.yaml:/c.yaml:ro -v /:/hostfs:ro \
+            "$COLLECTOR_IMAGE" validate --config=/c.yaml
+          echo "OK: collector gateway"
+          docker run --rm -v /tmp/cfg/otel-agent-config.yaml:/c.yaml:ro -v /:/hostfs:ro \
+            -e K8S_NODE_NAME=ci "$COLLECTOR_IMAGE" validate --config=/c.yaml
+          echo "OK: collector agent"
+
+      - name: the gateway config must NOT contain hostmetrics
+        # THE SPLIT IS THE WHOLE POINT OF THE TWO CONFIGS. If a future edit let hostmetrics
+        # back into the gateway, both files would still validate and the cluster would
+        # report ONE node's CPU as the whole cluster's - a wrong number, not an error.
+        run: |
+          set -euo pipefail
+          if grep -q 'hostmetrics' /tmp/cfg/otel-collector-config.yaml; then
+            echo "::error::the gateway config contains hostmetrics. A gateway pod sees one \
+          node, so its host metrics are one node's, mislabelled as the cluster's."
+            exit 1
+          fi
+          grep -q 'hostmetrics' /tmp/cfg/otel-agent-config.yaml \
+            || { echo "::error::the AGENT config has no hostmetrics - host metrics are now collected nowhere"; exit 1; }
+          echo "OK: hostmetrics is on the agent and only the agent"
+
+      - name: positive control - a backend validator must reject a broken config
+        # Especially load-bearing for mimir, whose validator is really -modules. If a future
+        # image made -modules print without loading the config, mimir would silently stop
+        # being checked while this job kept reporting green.
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in loki mimir tempo; do
+            cp "/tmp/cfg/$f-config.yaml" "/tmp/cfg/$f-broken.yaml"
+            echo '__positive_control_unknown_key__: true' >> "/tmp/cfg/$f-broken.yaml"
+          done
+          if docker run --rm -v /tmp/cfg/loki-broken.yaml:/c.yaml:ro --entrypoint loki \
+               "$LOKI_IMAGE" -config.file=/c.yaml -verify-config >/dev/null 2>&1; then
+            echo "::error::loki accepted an unknown top-level key"; fail=1
+          fi
+          if docker run --rm -v /tmp/cfg/mimir-broken.yaml:/c.yaml:ro --entrypoint mimir \
+               "$MIMIR_IMAGE" -config.file=/c.yaml -modules >/dev/null 2>&1; then
+            echo "::error::mimir -modules accepted an unknown top-level key - it is no \
+          longer validating the config file"; fail=1
+          fi
+          if docker run --rm -v /tmp/cfg/tempo-broken.yaml:/c.yaml:ro --entrypoint /tempo \
+               "$TEMPO_IMAGE" -config.file=/c.yaml -config.verify=true >/dev/null 2>&1; then
+            echo "::error::tempo accepted an unknown top-level key"; fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: all three reject a broken config"
+
+  # ---------------------------------------------------------------------------------------
+  opentofu:
+    # THE TOOL IS OpenTofu, NOT Terraform. The Terraform CLI moved to the BUSL-1.1
+    # source-available licence in 2023; OpenTofu is the MPL-2.0 fork, and it is what this
+    # repository's .terraform.lock.hcl already records.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+
+      - name: fmt, init and validate BOTH identity paths
+        # Validating only the default would leave the IRSA branch - an OIDC provider and a
+        # trust policy that are the entire security boundary - unparsed until someone flips
+        # the variable in anger.
+        run: |
+          set -euo pipefail
+          tofu -chdir=terraform/eks fmt -check -diff
+          tofu -chdir=terraform/eks init -backend=false -input=false
+          tofu -chdir=terraform/eks validate
+          echo "OK: pod identity path"
+          tofu -chdir=terraform/eks validate -var use_pod_identity=false
+          echo "OK: IRSA path"
+
+  # ---------------------------------------------------------------------------------------
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck the k8s helper scripts
+        # A GATE, not advisory. config-check.yml covers scripts/; these live in k8s/scripts/
+        # and would otherwise be checked by nothing.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning k8s/scripts/*.sh
+          echo "OK: shellcheck gate passed"

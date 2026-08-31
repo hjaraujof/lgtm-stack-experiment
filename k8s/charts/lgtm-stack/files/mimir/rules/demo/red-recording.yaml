@@ -1,0 +1,90 @@
+# RED recording rules, computed from the spanmetrics connector's unbiased pre-sample stream.
+#
+# NAMING RULE THAT THIS FILE ENFORCES: when a recorded series changes what it MEASURES, RENAME it.
+# A new numerator under an old name silently moves every saved query, dashboard panel and alert that
+# reads it, and none of them report an error. Two renames here followed that rule:
+#   service:error_ratio:5m -> service:http_5xx_ratio:5m   (span status -> HTTP status code)
+#   namespace:*            -> env:*                       (a label that was never emitted -> a
+#                                                          derived one that is)
+groups:
+  - name: red-recording
+    interval: 30s
+    rules:
+      - record: service:requests:rate5m
+        expr: sum by (service_name) (rate(traces_span_metrics_calls_total[5m]))
+      # RAW span-status error rate across ALL span kinds. This is a TRIAGE series, NOT an SLI, and
+      # nothing alerts on it. See the ratio below for what replaced it.
+      #
+      # THE BENIGN-ERROR FLOOR. STATUS_CODE_ERROR includes any error an application catches and
+      # handles - the classic example is the losing side of an optimistic-concurrency write, which is
+      # caught, retried and entirely normal. The spanmetrics connector emits no exception-type
+      # dimension (see spanmetrics.dimensions in otel-collector-config.yaml), so that benign class
+      # CANNOT be subtracted in PromQL here. Every ratio built on span status carries this floor.
+      #
+      # It is kept deliberately, for two jobs no status-code series can do. It answers "is ANYTHING
+      # erroring, anywhere in the call tree", which is the first question a responder asks. And it is
+      # the ONLY error signal that covers a service which emits no HTTP status codes at all - see
+      # ServiceAvailabilitySLIUnmeasurable in slo-burn.yaml. Read it as a lead, never as a breach.
+      - record: service:errors:rate5m
+        expr: sum by (service_name) (rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m]))
+      # 5m availability ratio: the fraction of inbound HTTP requests answered 5xx.
+      #
+      # Pairs with the 1h window in ServiceErrorBudgetFastBurn, so it MUST use the identical
+      # numerator. A status-code 1h against a span-status 5m makes that alert compare two different
+      # questions, and it then quietly never fires.
+      #
+      # NOT expressed as service:errors:rate5m / service:requests:rate5m. Those two series are
+      # all-kind and all-span BY DESIGN - service:requests:rate5m is also the liveness signal for
+      # ServiceTelemetrySilent, where "any span at all" is exactly the right question - so neither is
+      # a valid term of this ratio. Full derivation and the denominator choice: slo-burn.yaml.
+      - record: service:http_5xx_ratio:5m
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[5m]))
+            / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[5m])), 1e-9)
+      - record: service:latency_p99_ms:5m
+        expr: histogram_quantile(0.99, sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))
+      # Additional latency quantiles (same low cardinality as p99 - keyed by service_name only).
+      # Precomputed at 30s so dashboards read a single series instead of re-running the
+      # expensive histogram_quantile on every render (query-time CPU relief on the CPU-bound box).
+      - record: service:latency_p50_ms:5m
+        expr: histogram_quantile(0.50, sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))
+      - record: service:latency_p95_ms:5m
+        expr: histogram_quantile(0.95, sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))
+      # Env rollup: aggregate RED across every service in an env (prod, uat, qa, dev, ...).
+      #
+      # A CAUTIONARY TALE ABOUT A DECLARED-BUT-UNSET DIMENSION. These rules used to key
+      # `by (service_namespace)`. The spanmetrics connector DECLARES service.namespace as a
+      # dimension, but the instrumented apps never set the resource attribute, so the label was empty
+      # on every series and `sum by (service_namespace)` collapsed ALL envs into a single meaningless
+      # series with an empty label value. It produced a plausible-looking graph of nothing.
+      #
+      # THE GENERAL RULE: a declared dimension is not an emitted one. Verify a label carries values
+      # before you aggregate by it:  count by (service_namespace) (traces_span_metrics_calls_total)
+      #
+      # The only env-bearing label here is the compound service_name `<tenant>/<env>/<component>`.
+      # env is its middle segment, extracted with label_replace. A service_name that does not match
+      # the 3-segment pattern keeps env="" and lands in a visible residual bucket, rather than being
+      # silently misfiled into a real env.
+      - record: env:requests:rate5m
+        expr: |
+          sum by (env) (
+            label_replace(
+              rate(traces_span_metrics_calls_total[5m]),
+              "env", "$1", "service_name", "[^/]+/([^/]+)/.*"
+            )
+          )
+      - record: env:errors:rate5m
+        expr: |
+          sum by (env) (
+            label_replace(
+              rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m]),
+              "env", "$1", "service_name", "[^/]+/([^/]+)/.*"
+            )
+          )
+      # Per-endpoint request + error rate, restricted to SERVER spans (actual request handlers,
+      # not internal spans) to bound output cardinality to (service_name x request-endpoint).
+      # Makes individual hot/failing endpoints alertable, not just whole services.
+      - record: endpoint:requests:rate5m
+        expr: sum by (service_name, span_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[5m]))
+      - record: endpoint:errors:rate5m
+        expr: sum by (service_name, span_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}[5m]))
