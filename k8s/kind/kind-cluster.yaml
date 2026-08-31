@@ -10,6 +10,20 @@
 # (it tolerates the control-plane taint and selects the ingress-ready label that the
 # node registers below). Without extraPortMappings, an Ingress object exists, resolves
 # and answers nothing, because no host port reaches the cluster.
+#
+# 8080 AND 8443 ON THE HOST, NOT 80 AND 443. ROOTLESS DOCKER CANNOT BIND A PRIVILEGED
+# PORT. The container side stays 80 and 443, so ingress-nginx and every Ingress object
+# are unchanged; only the host mapping moves. The failure this avoids names the fix but
+# not the cause:
+#   cannot expose privileged port 80, you can add
+#   'net.ipv4.ip_unprivileged_port_start=80' to /etc/sysctl.conf (currently 1024)
+#
+# THAT SUGGESTED SYSCTL IS THE WRONG TRADE. Lowering the threshold system-wide lets ANY
+# unprivileged process on the machine bind port 80 — including one that beats a real
+# service to it. A two-digit change to a local URL is the cheaper price.
+#
+# On ROOTFUL Docker, 80 and 443 work directly. Change hostPort below if that is your
+# setup, and drop the port from the URLs in k8s/README.md to match.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: lgtm
@@ -24,10 +38,10 @@ nodes:
             node-labels: "ingress-ready=true"
     extraPortMappings:
       - containerPort: 80
-        hostPort: 80
+        hostPort: 8080
         protocol: TCP
       - containerPort: 443
-        hostPort: 443
+        hostPort: 8443
         protocol: TCP
   - role: worker
   - role: worker

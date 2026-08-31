@@ -175,9 +175,14 @@ failed=0
 
 for i in $(seq 1 $COUNT); do
     if send_trace $i; then
-        ((success++))
+        # `$(( ))`, NOT `(( ))`. Under `set -e`, `((success++))` EXITS THE SCRIPT: a
+        # `(( ))` command returns 1 when its expression evaluates to zero, and
+        # post-increment evaluates to the OLD value - so the very first increment, from
+        # 0, terminates the loop after one trace and never prints the summary.
+        # Identical defect to the one in send-test-metrics.sh.
+        success=$((success + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
 
     # Small delay between traces

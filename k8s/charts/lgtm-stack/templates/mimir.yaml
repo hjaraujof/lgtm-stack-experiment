@@ -59,6 +59,24 @@ spec:
         - name: mimir
           image: {{ .Values.images.mimir }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
+          # THE MOST IMPORTANT LINE IN THIS FILE, AND IT LOOKS LIKE HOUSEKEEPING.
+          #
+          # The grafana/mimir image declares `User=0` and `WorkingDir=/`. So under Docker
+          # Compose, Mimir runs as ROOT and its several RELATIVE default paths resolve
+          # into `/`, which root may write. Nobody notices.
+          #
+          # This chart runs it as UID 10001, matching Loki and Tempo. That is a genuine
+          # improvement over the Compose plane - and it is what makes those relative
+          # defaults fail. Mimir does not degrade when it cannot write them; it REFUSES
+          # TO START, twice over and with two unrelated-looking messages:
+          #   failed to create activity file: open ./metrics-activity.log: permission denied
+          #   store-gateway: failed to access directory ./tsdb-sync/: open .check: permission denied
+          #
+          # Setting each path by flag fixes them one at a time and misses the next one.
+          # A writable working directory fixes the class. /tmp/mimir is the data volume,
+          # which fsGroup already chowns to this UID, and config/mimir-config.yaml
+          # already points its EXPLICIT paths inside it.
+          workingDir: /tmp/mimir
           args:
             - -target={{ .Values.mimir.target }}
             - -config.file=/etc/mimir/config.yaml

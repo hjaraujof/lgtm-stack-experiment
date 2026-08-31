@@ -57,12 +57,27 @@ send_metrics() {
     request_count=$((RANDOM % 1000 + 100))
     local request_duration
     request_duration=$((RANDOM % 500 + 50))
+    # THESE TWO ARE FORMATTED WITH printf, NOT COMPUTED WITH bc, AND THE REASON IS THAT
+    # THE OUTPUT LANDS INSIDE JSON.
+    #
+    # `echo "scale=2; 4 / 100" | bc` prints `.04`. GNU bc omits the leading zero, and a
+    # leading-dot number IS NOT VALID JSON. RANDOM % 10 is always 0-9, so the value was
+    # always below 1, so this was always emitted in the invalid form and the collector
+    # always answered:
+    #   HTTP 400 ReadUint64: unsupported value type ... "asDouble": .04
+    # The script prints `Failed!` and continues, which is why it went unnoticed.
+    #
+    # The second failure is worse and quieter: bc is NOT INSTALLED on many machines,
+    # including a plain NixOS host. Then the substitution yields an EMPTY STRING and the
+    # payload becomes `"asDouble": ,` - still a 400, from a completely different cause.
+    #
+    # printf needs no external program and cannot produce either shape.
     local error_rate
-    error_rate=$(echo "scale=2; $((RANDOM % 10)) / 100" | bc)
+    error_rate=$(printf '0.%02d' $((RANDOM % 10)))
     local active_connections
     active_connections=$((RANDOM % 50 + 5))
     local cpu_usage
-    cpu_usage=$(echo "scale=2; $((RANDOM % 80 + 10))" | bc)
+    cpu_usage=$(printf '%d.00' $((RANDOM % 80 + 10)))
 
     local payload
     payload=$(cat <<EOF
@@ -218,9 +233,19 @@ failed=0
 for i in $(seq 1 $COUNT); do
     echo ""
     if send_metrics $i; then
-        ((success++))
+        # `$(( ))`, NOT `(( ))`. THE SCRIPT RUNS UNDER `set -e` (line 17), AND
+        # `((success++))` EXITS IT.
+        #
+        # A `(( ))` command's exit status is 0 when the expression is NON-ZERO and 1 when
+        # it is zero. Post-increment evaluates to the OLD value, so the FIRST
+        # `((success++))` - when success is still 0 - returns 1, and `set -e` treats that
+        # as a failed command and terminates the script.
+        #
+        # The effect: the loop always stopped after the first batch, whichever branch it
+        # took, and the summary below never printed. It looked like the send had hung.
+        success=$((success + 1))
     else
-        ((failed++))
+        failed=$((failed + 1))
     fi
 
     # Delay between batches for time-series data
