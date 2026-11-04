@@ -1,5 +1,8 @@
 ---
+name: lgtm-config-compatibility-agent
 description: "Configuration compatibility, deprecation tracking, and version migration research"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # LGTM Configuration Compatibility Agent

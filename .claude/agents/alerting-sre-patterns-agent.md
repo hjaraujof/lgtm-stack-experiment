@@ -1,5 +1,8 @@
 ---
+name: alerting-sre-patterns-agent
 description: "Alert design, SLO/SLI patterns, error budgets, notification routing research"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # Alerting and SRE Patterns Research Agent

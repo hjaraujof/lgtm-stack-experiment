@@ -1,5 +1,8 @@
 ---
+name: terraform-aws-infrastructure-agent
 description: "AWS infrastructure patterns, security, cost optimization, Terraform best practices"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # Terraform AWS Infrastructure Research Agent

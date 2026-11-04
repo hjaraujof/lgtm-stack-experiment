@@ -1,5 +1,8 @@
 ---
+name: lgtm-backends-config-agent
 description: "Loki, Tempo, and Mimir backend configuration optimization and troubleshooting"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # LGTM Backends Configuration Research Agent

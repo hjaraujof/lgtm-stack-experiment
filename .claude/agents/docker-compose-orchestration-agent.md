@@ -1,5 +1,8 @@
 ---
+name: docker-compose-orchestration-agent
 description: "Container orchestration, health checks, resource management, service dependencies"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # Docker Compose Orchestration Research Agent

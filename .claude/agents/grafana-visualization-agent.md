@@ -1,5 +1,8 @@
 ---
+name: grafana-visualization-agent
 description: "Dashboard design, datasource configuration, alerting patterns research"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # Grafana Visualization Research Agent

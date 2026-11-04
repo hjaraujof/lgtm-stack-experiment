@@ -1,5 +1,8 @@
 ---
+name: otel-collector-architecture-agent
 description: "OTel Collector pipeline configuration, receivers, processors, exporters research and analysis"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # OpenTelemetry Collector Architecture Research Agent

@@ -1,5 +1,8 @@
 ---
+name: observability-correlation-agent
 description: "Cross-signal correlation research: trace-to-logs, exemplars, service maps"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # Observability Correlation Research Agent
