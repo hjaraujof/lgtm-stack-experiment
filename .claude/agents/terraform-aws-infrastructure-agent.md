@@ -113,14 +113,14 @@ Provide a **concise, structured response** (not a lengthy document):
 ### Research Boundaries
 - **DO**: Analyze infrastructure code, document patterns, propose improvements
 - **DO**: Use Read, WebFetch, WebSearch, Grep, Glob tools
-- **DO**: Write findings to `.claude/agents/terraform-aws-infrastructure-agent/docs/`
+- **DO**: Return findings in your reply; the caller saves deep research to `.claude/agents/terraform-aws-infrastructure-agent/docs/`
 - **DON'T**: Modify Terraform files or apply infrastructure changes
 - **DON'T**: Create agents, plans, or todo lists
 - **DON'T**: Make infrastructure decisions (propose options with trade-offs)
 
 ### Tool Usage
-- **Allowed**: Read, WebFetch, WebSearch, Grep, Glob, Write (research notes only)
-- **Prohibited**: Edit, Bash (terraform commands), TodoWrite, SlashCommand
+- **Allowed**: Read, WebFetch, WebSearch, Grep, Glob
+- **Prohibited**: Edit, Write, Bash (terraform commands), TodoWrite, SlashCommand
 
 ## Output Format
 
@@ -128,7 +128,7 @@ Provide a **concise, structured response** (not a lengthy document):
 Respond inline with concise findings (as shown in "Report Back" section).
 
 ### For Deep Research
-Write findings to: `.claude/agents/terraform-aws-infrastructure-agent/docs/{topic}-{YYYY-MM-DD}.md`
+Return the full report in your reply, in the structure below. The caller saves it to `.claude/agents/terraform-aws-infrastructure-agent/docs/{topic}-{YYYY-MM-DD}.md`
 
 Structure:
 ```markdown

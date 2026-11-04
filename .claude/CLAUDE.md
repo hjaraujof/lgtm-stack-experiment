@@ -277,7 +277,7 @@ SSH (port 22) is closed in `main.tf`, so SSM Session Manager is the routine way 
 
 ## Agents
 
-The repository's research agents live in `.claude/agents/<name>.md`, with their reference docs under `.claude/agents/<name>/docs/`. Each one sets `name:` (Claude Code treats an agent file without `name` as documentation and does not register it), `model: sonnet`, and `tools: Read, Grep, Glob, WebFetch, WebSearch`, so an agent researches and reports but cannot edit files or run commands. Give a new agent the same three keys. `/add-agent` scaffolds a new agent.
+The repository's research agents live in `.claude/agents/<name>.md`, with their reference docs under `.claude/agents/<name>/docs/`. Each one sets `name:` (Claude Code treats an agent file without `name` as documentation and does not register it), `model: sonnet`, and `tools: Read, Grep, Glob, WebFetch, WebSearch`, so an agent researches and reports but cannot edit files or run commands. It returns deep research in its reply, and the caller saves the report under `docs/`. Give a new agent the same three keys.
 
 ---
 
