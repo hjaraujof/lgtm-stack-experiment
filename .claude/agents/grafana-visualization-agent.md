@@ -1,5 +1,8 @@
 ---
+name: grafana-visualization-agent
 description: "Dashboard design, datasource configuration, alerting patterns research"
+model: sonnet
+tools: Read, Grep, Glob, WebFetch, WebSearch
 ---
 
 # Grafana Visualization Research Agent
@@ -110,14 +113,14 @@ Provide a **concise, structured response** (not a lengthy document):
 ### Research Boundaries
 - **DO**: Analyze configurations, document patterns, propose improvements
 - **DO**: Use Read, WebFetch, WebSearch, Grep, Glob tools
-- **DO**: Write findings to `.claude/agents/grafana-visualization-agent/docs/`
+- **DO**: Return findings in your reply; the caller saves deep research to `.claude/agents/grafana-visualization-agent/docs/`
 - **DON'T**: Modify configuration files or create dashboards
 - **DON'T**: Create agents, plans, or todo lists
 - **DON'T**: Make design decisions (propose options with trade-offs)
 
 ### Tool Usage
-- **Allowed**: Read, WebFetch, WebSearch, Grep, Glob, Write (research notes only)
-- **Prohibited**: Edit, TodoWrite, SlashCommand, task delegation tools
+- **Allowed**: Read, WebFetch, WebSearch, Grep, Glob
+- **Prohibited**: Edit, Write, TodoWrite, SlashCommand, task delegation tools
 
 ## Output Format
 
@@ -125,7 +128,7 @@ Provide a **concise, structured response** (not a lengthy document):
 Respond inline with concise findings (as shown in "Report Back" section).
 
 ### For Deep Research
-Write findings to: `.claude/agents/grafana-visualization-agent/docs/{topic}-{YYYY-MM-DD}.md`
+Return the full report in your reply, in the structure below. The caller saves it to `.claude/agents/grafana-visualization-agent/docs/{topic}-{YYYY-MM-DD}.md`
 
 Structure:
 ```markdown
