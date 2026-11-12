@@ -42,13 +42,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Generate random hex string for trace/span IDs (for correlation)
+# Random hex for trace and span IDs. od is in coreutils, so this needs no extra tool. xxd,
+# which this used before, is absent on many hosts: there the ID came out EMPTY, the collector
+# still answered 200, and Tempo dropped every span as invalid_trace_id while this script
+# printed Success. So a wrong length now stops the script instead.
+random_hex() {
+    local hex
+    hex=$(od -An -tx1 -N"$1" /dev/urandom | tr -d ' \n')
+    if [ "${#hex}" -ne $(( $1 * 2 )) ]; then
+        echo "ERROR: wanted $(( $1 * 2 )) hex chars for an ID, got ${#hex}" >&2
+        return 1
+    fi
+    printf '%s' "$hex"
+}
+
 generate_trace_id() {
-    head -c 16 /dev/urandom | xxd -p | tr -d '\n'
+    random_hex 16
 }
 
 generate_span_id() {
-    head -c 8 /dev/urandom | xxd -p | tr -d '\n'
+    random_hex 8
 }
 
 # Convert to nanoseconds
@@ -62,9 +75,9 @@ SEVERITY_NUMBERS=(1 5 9 13 17)
 
 send_logs() {
     local trace_id
-    trace_id=$(generate_trace_id)
+    trace_id=$(generate_trace_id) || exit 1
     local span_id
-    span_id=$(generate_span_id)
+    span_id=$(generate_span_id) || exit 1
     local iteration=$1
 
     # Build log records array
