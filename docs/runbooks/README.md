@@ -22,6 +22,7 @@ These are first-response guides, not full incident procedures.
 | CollectorTailSamplingDroppingTraces | [collector-tail-sampling.md](collector-tail-sampling.md) | critical |
 | CollectorExportFailing, CollectorQueueSaturated | [collector-export.md](collector-export.md) | crit/warn |
 | LokiSamplesDiscarded, LokiTenantFakeIngest | [loki-discards.md](loki-discards.md) | warning |
+| LokiRulerRemoteWriteFailing, LokiRulerNotAppending | [loki-ruler-remote-write.md](loki-ruler-remote-write.md) | warning |
 | AlertDeliverySilent, AlertmanagerConfigChanged, Watchdog | [alert-delivery-silent.md](alert-delivery-silent.md) | crit/warn |
 
 Not alert-driven, but kept here:

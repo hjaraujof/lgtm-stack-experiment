@@ -1,0 +1,162 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Failing traces for an environment, straight from Tempo. Service RED tells you a service is erroring; this is the board that shows you WHICH requests failed so you can open one. Scoped by regex on the env segment of service.name instead, so a new service or a new environment needs no edit here.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": ["red"],
+      "targetBlank": false,
+      "title": "Service RED (rates and ratios)",
+      "tooltip": "Which service is erroring, and by how much",
+      "type": "dashboards"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "panels": [],
+      "title": "Failing traces — $env",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "description": "Every trace in this environment whose root span carries status=error, newest first. Click a row to open the trace.\n\nScoped with `resource.service.name =~ \"(?:[^/]+/)?<env>/[^/]+\"` — a regex on the env segment of the compound service name, with the tenant segment optional, NOT a list. A hardcoded list of services goes stale as soon as a service is added.\n\nTHREE LIMITS TO KNOW BEFORE YOU CONCLUDE ANYTHING IS ABSENT. An empty table is NOT the same as a healthy environment, and the worst case is the third one, because it hits hardest exactly when things are going wrong.\n\n1. Where the application head-samples traces, the sample is taken before the collector exists. A failing request appears here only if its trace won the sampling roll. Absence of an error trace is NOT evidence the error did not happen — count errors in Mimir, read causes here.\n\n2. `status = error` is SPAN STATUS. Under OTel semantics a 4xx does NOT set it, so a 401 storm is invisible on this board no matter how large. That is what ServiceAuthFailureRateHigh exists for. Services that leave span status UNSET even on failure (Next.js apps commonly do), so they are under-represented here for a third, separate reason.\n\n3. A TRACE THAT EXCEEDS max_bytes_per_trace IS DISCARDED WHOLE, and never reaches this board at all. Tempo drops it at ingest, so no amount of querying recovers it. A service whose ORM or client library bursts spans into one trace can lose most of its spans this way with reason=trace_too_large - the runaway traces, which are the ones you most want to read, are precisely the ones deleted. The signal is the TempoTraceTooLarge alert and the 'Tempo discarded spans (by reason)' panel on the LGTM Stack Health board. CHECK THAT ALERT BEFORE TRUSTING AN EMPTY TABLE HERE.\n\nTempo search reaches back only as far as block_retention in config/tempo-config.yaml.",
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 1 },
+      "id": 2,
+      "options": { "cellHeight": "sm", "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false }, "showHeader": true },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "limit": 200,
+          "query": "{resource.service.name =~ \"(?:[^/]+/)?$env/[^/]+\" && status = error}",
+          "queryType": "traceql",
+          "refId": "A",
+          "tableType": "traces"
+        }
+      ],
+      "title": "Error traces — $env",
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "id": 10,
+      "panels": [],
+      "title": "Which service, and how much — $env",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Span-status error rate per service, so you know what you are looking at in the table above. Recording rule service:errors:rate5m.\n\nUNLIKE the trace table, this is unbiased by sampling as a RATE — a uniform sample of a steady error rate still measures the rate correctly. It is the count that is biased, not the shape. It can carry a benign floor of expected errors (a conditional-write conflict, say), so read a step change rather than a level. The axis sits slightly below zero so a healthy flat zero is drawn rather than hidden.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMin": -0.0015, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 16 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "expr": "service:errors:rate5m{service_name=~\"(?:[^/]+/)?($env)/[^/]+\"}",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Error rate by service — $env",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "The same errors narrowed to the inbound endpoint that produced them — SERVER spans only, so these are request handlers rather than internal spans. Recording rule endpoint:errors:rate5m. This is the bridge between 'a service is erroring' and a TraceQL query you can actually write.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMin": -0.0015, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 16 },
+      "id": 12,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Max", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "expr": "topk(10, endpoint:errors:rate5m{service_name=~\"(?:[^/]+/)?($env)/[^/]+\"})",
+          "legendFormat": "{{service_name}} {{span_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Top 10 failing endpoints — $env",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": ["errors", "traces", "tempo", "services"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": "prod", "value": "prod" },
+        "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+        "definition": "label_values(env:requests:rate5m, env)",
+        "description": "Which environment's failing traces to show. Read from the env:* recording rules, so a new environment appears here on its own. SINGLE-select on purpose: the value is interpolated into a TraceQL regex, and a multi-value expansion there is far harder to reason about than one that is simply wrong and obvious.",
+        "includeAll": false,
+        "label": "Environment",
+        "multi": false,
+        "name": "env",
+        "options": [],
+        "query": { "query": "label_values(env:requests:rate5m, env)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Error traces (Tempo)",
+  "uid": "error-traces",
+  "version": 1,
+  "weekStart": ""
+}

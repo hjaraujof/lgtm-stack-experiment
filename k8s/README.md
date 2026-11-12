@@ -86,6 +86,7 @@ transformed rather than copied, so that gap is real.
 | `mimir-am-init` | Deployment | It is a loop with its own sleep, so it stays one. |
 | config bind mounts | ConfigMap + `checksum/config` annotation | Without the annotation a config change never restarts the pod. |
 | `config/mimir/rules:ro` | ConfigMap, read-only | `helm upgrade` replaces `git pull` as the deploy. |
+| `config/loki/rules:ro` | ConfigMap `loki-rules-demo`, read-only, at `/etc/loki/rules/demo` | Same as Mimir. A wrong path loads nothing and Loki still reports healthy, so check `/loki/api/v1/rules` with `X-Scope-OrgID: demo`. |
 | `.env` passwords | a mounted **file**, never a value | See "Secrets" below. |
 | `nginx` + `certbot` (2 services, 5 scripts) | Ingress + cert-manager | About 20 lines replace the pair. |
 | `mem_limit: 6g` | `resources.limits.memory` | `limit_percentage` resolves against the cgroup in both. |

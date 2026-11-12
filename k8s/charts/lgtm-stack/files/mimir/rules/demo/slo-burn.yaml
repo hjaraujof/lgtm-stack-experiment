@@ -13,13 +13,18 @@
 #
 # DEPLOY: `git pull` on the box and nothing else. ruler_storage is the bind-mounted `local` backend
 # (mimir-config.yaml) and the ruler re-scans it every poll_interval. No mimirtool load, no restart.
-# The Alertmanager config is NOT symmetrical - see scripts/init-mimir-alertmanager.sh.
+# The Alertmanager config is NOT symmetrical: a `git pull` alone does NOT deploy a change to
+# demo-am.yaml. scripts/init-mimir-alertmanager.sh is the long-running `mimir-am-init` container, not
+# a one-shot, so do not "run" it. See docker-compose.yml above mimir-am-init for how a change reaches
+# it, and verify against Mimir's own API.
 #
 # COST: every rule here is keyed by service_name only, the same low cardinality as the service:*
 # rules in red-recording.yaml, so ruler evaluation cost is negligible.
 #
 # SERVICE NAME CONVENTION: see the header of stack-alerts.yaml. Alerts scope to live envs with
-# `service_name=~"[^/]+/(prod|uat)/[^/]+"`, a regex on the middle segment of `<tenant>/<env>/<component>`.
+# `service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"`, a regex on the env segment of `<tenant>/<env>/<component>`
+# or of the two-segment `<env>/<component>`. The tenant segment is optional, so a service that drops
+# it does not silently leave every live alert.
 
 groups:
   - name: slo-error-budget-recordings
@@ -57,17 +62,36 @@ groups:
       # Restricting the denominator instead makes such a service produce NO SERIES, and
       # ServiceAvailabilitySLIUnmeasurable below turns that silence into a visible alert.
       # A MISSING MEASUREMENT MUST NOT READ AS A PASSING ONE.
+      #
+      # Every ratio in this group carries `or (denominator * 0)` on its numerator, so a service that
+      # emits status codes but has NOT yet returned a 5xx (or a 401/403) records a real 0 instead of
+      # no series. Rationale, and the proof that a no-status-code service is UNCHANGED: red-recording.yaml,
+      # above service:http_5xx_ratio:5m. Keep all four windows identical in shape. FastBurn `and`s
+      # the 1h against the 5m, and SlowBurn the 6h against the 30m, so a numerator that differs
+      # between windows makes those alerts compare two different questions and quietly never fire.
       - record: service:http_5xx_ratio:30m
         expr: |
-          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[30m]))
+          (
+            sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[30m]))
+              or
+            (sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[30m])) * 0)
+          )
             / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[30m])), 1e-9)
       - record: service:http_5xx_ratio:1h
         expr: |
-          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[1h]))
+          (
+            sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[1h]))
+              or
+            (sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[1h])) * 0)
+          )
             / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[1h])), 1e-9)
       - record: service:http_5xx_ratio:6h
         expr: |
-          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[6h]))
+          (
+            sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[6h]))
+              or
+            (sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[6h])) * 0)
+          )
             / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[6h])), 1e-9)
 
       # Sustained auth-failure ratio. Deliberately a SEPARATE SLI from availability above.
@@ -80,7 +104,11 @@ groups:
       # in would put a permanent floor under every service.
       - record: service:http_auth_fail_ratio:30m
         expr: |
-          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"401|403"}[30m]))
+          (
+            sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"401|403"}[30m]))
+              or
+            (sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[30m])) * 0)
+          )
             / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[30m])), 1e-9)
 
   - name: slo-burn-alerts
@@ -90,8 +118,8 @@ groups:
       # At that rate the 30-day budget is gone in about 2 days, so page now.
       - alert: ServiceErrorBudgetFastBurn
         expr: |
-          service:http_5xx_ratio:1h{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (14.4 * 0.01)
-            and service:http_5xx_ratio:5m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (14.4 * 0.01)
+          service:http_5xx_ratio:1h{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"} > (14.4 * 0.01)
+            and service:http_5xx_ratio:5m{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"} > (14.4 * 0.01)
         for: 2m
         labels: {severity: critical}
         annotations:
@@ -101,8 +129,8 @@ groups:
       # Slow burn: 6x the budget on BOTH the 6h and 30m windows, so ticket rather than page.
       - alert: ServiceErrorBudgetSlowBurn
         expr: |
-          service:http_5xx_ratio:6h{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (6 * 0.01)
-            and service:http_5xx_ratio:30m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > (6 * 0.01)
+          service:http_5xx_ratio:6h{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"} > (6 * 0.01)
+            and service:http_5xx_ratio:30m{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"} > (6 * 0.01)
         for: 15m
         labels: {severity: warning}
         annotations:
@@ -134,8 +162,8 @@ groups:
       # so the gate and both SLIs measure one population.
       - alert: ServiceAuthFailureRateHigh
         expr: |
-          service:http_auth_fail_ratio:30m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > 0.10
-            and sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!="",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 150
+          service:http_auth_fail_ratio:30m{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"} > 0.10
+            and sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!="",service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[30m])) > 150
         for: 15m
         labels: {severity: warning}
         annotations:
@@ -165,8 +193,8 @@ groups:
       # services out - they have nothing to measure either way.
       - alert: ServiceAvailabilitySLIUnmeasurable
         expr: |
-          (sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 300)
-            unless (sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!="",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 0)
+          (sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[30m])) > 300)
+            unless (sum by (service_name) (increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!="",service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[30m])) > 0)
         for: 30m
         labels: {severity: warning}
         annotations:
@@ -227,8 +255,8 @@ groups:
       # HighServiceErrorRatio and the count-based burn-rate alerts above.
       - alert: ServiceLatencySLIBreach
         expr: |
-          service:latency_fast_ratio:30m{service_name=~"[^/]+/(prod|uat)/[^/]+"} < 0.95
-            and sum by (service_name) (increase(traces_span_metrics_duration_milliseconds_count{span_kind="SPAN_KIND_SERVER",service_name=~"[^/]+/(prod|uat)/[^/]+"}[30m])) > 300
+          service:latency_fast_ratio:30m{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"} < 0.95
+            and sum by (service_name) (increase(traces_span_metrics_duration_milliseconds_count{span_kind="SPAN_KIND_SERVER",service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[30m])) > 300
         for: 15m
         labels: {severity: warning}
         annotations:

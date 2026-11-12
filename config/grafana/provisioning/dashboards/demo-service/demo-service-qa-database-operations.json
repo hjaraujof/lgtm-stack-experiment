@@ -16,7 +16,7 @@
       "id": 1,
       "options": {"legend": {"calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.collection.name != \"\"} | rate() by (span.db.collection.name)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.collection.name != \"\"} | rate() by (span.db.collection.name)", "refId": "A"}],
       "title": "Operations by Collection Over Time",
       "type": "timeseries"
     },
@@ -28,7 +28,7 @@
       "id": 2,
       "options": {"barRadius": 0.05, "barWidth": 0.7, "fullHighlight": false, "groupWidth": 0.7, "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": false}, "orientation": "horizontal", "showValue": "auto", "stacking": "none", "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 0},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.collection.name != \"\"} | count_over_time() by (span.db.collection.name) | topk(20)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.collection.name != \"\"} | count_over_time() by (span.db.collection.name) | topk(20)", "refId": "A"}],
       "title": "Top Collections by Call Volume",
       "type": "barchart"
     },
@@ -41,7 +41,7 @@
       "id": 3,
       "options": {"displayLabels": ["name", "percent"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"]}, "pieType": "donut", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.limit > 0} | count_over_time() by (span.db.query.limit)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.query.limit > 0} | count_over_time() by (span.db.query.limit)", "refId": "A"}],
       "title": "Limit Value Distribution",
       "type": "piechart"
     },
@@ -53,7 +53,7 @@
       "id": 4,
       "options": {"displayLabels": ["name", "percent"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"]}, "pieType": "donut", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.offset > 0} | count_over_time() by (span.db.query.offset)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.query.offset > 0} | count_over_time() by (span.db.query.offset)", "refId": "A"}],
       "title": "Offset Value Distribution",
       "type": "piechart"
     },
@@ -66,8 +66,8 @@
       "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "horizontal", "percentChangeColorMode": "standard", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "showPercentChange": false, "textMode": "auto", "wideLayout": true},
       "pluginVersion": "11.3.1",
       "targets": [
-        {"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.has_where = \"true\"} | count_over_time()", "refId": "A"},
-        {"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.has_orderby = \"true\"} | count_over_time()", "refId": "B"}
+        {"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.query.has_where = \"true\"} | count_over_time()", "refId": "A"},
+        {"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.query.has_orderby = \"true\"} | count_over_time()", "refId": "B"}
       ],
       "title": "Query Complexity (WHERE / ORDER BY)",
       "type": "stat"
@@ -81,7 +81,7 @@
       "id": 6,
       "options": {"legend": {"calcs": ["mean", "max", "sum"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.record_count > 0} | avg_over_time(span.db.record_count)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.record_count > 0} | avg_over_time(span.db.record_count)", "refId": "A"}],
       "title": "Batch Sizes Over Time",
       "type": "timeseries"
     },
@@ -93,7 +93,7 @@
       "id": 7,
       "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "percentChangeColorMode": "standard", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "showPercentChange": false, "textMode": "auto", "wideLayout": true},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-a/qa/demo-service\" && span.db.query.cursor != \"\"} | count_over_time()", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-a/)?qa/demo-service$\" && span.db.query.cursor != \"\"} | count_over_time()", "refId": "A"}],
       "title": "Cursor Pagination Usage",
       "type": "stat"
     }

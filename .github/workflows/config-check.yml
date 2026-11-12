@@ -36,6 +36,10 @@ on:
     paths:
       - "config/**"
       - "!config/mimir/rules/**" # covered by mimir-rules-check.yml
+      # loki-rules-check.yml boots the real Loki against the rule files, and nothing here can
+      # validate LogQL. Only the RULES directory is excluded: config/loki-config.yaml stays in
+      # scope and is still -verify-config'd here, because the ruler block lives in it.
+      - "!config/loki/rules/**" # covered by loki-rules-check.yml
       # Globs, not exact names. An exact-name filter silently skips a NEW deployable the day someone
       # adds one, and nobody notices because the job still reports green on everything else.
       - "docker-compose*.yml"
@@ -47,16 +51,19 @@ on:
       # Without this, editing only the reconciler test skips the job that runs it. The test would
       # look green on its own PR while never having executed.
       - "tests/scripts/**"
+      - "tests/collector/**" # same reason, for the collector redaction test
       - ".github/workflows/config-check.yml"
   push:
     branches: [main, master]
     paths:
       - "config/**"
       - "!config/mimir/rules/**"
+      - "!config/loki/rules/**" # covered by loki-rules-check.yml
       - "docker-compose*.yml"
       - "user_data*.tpl"
       - "scripts/**"
       - "tests/scripts/**"
+      - "tests/collector/**"
 
 permissions:
   contents: read
@@ -75,7 +82,7 @@ jobs:
   collector:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: validate collector config
         # -v /:/hostfs:ro is REQUIRED and is not incidental: `validate` instantiates receivers, and
@@ -110,11 +117,22 @@ jobs:
           fi
           echo "OK: validator correctly rejects a broken collector config"
 
+      - name: secret query parameters are redacted from spans and logs
+        # A GATE. `validate` proves the redaction statements parse, not what they match: a pattern
+        # that matches nothing, or one that eats the rest of the query, validates cleanly. This runs
+        # transform/normalize and transform/redact_logs, read out of the REAL config, in
+        # $COLLECTOR_IMAGE, and asserts on the debug exporter's output. It checks that both
+        # processors are wired into their pipelines, and it carries its own negative control, so it
+        # fails if the redaction is removed. PyYAML ships with ubuntu-latest's python3.
+        run: |
+          set -euo pipefail
+          python3 tests/collector/test-redaction.py
+
   # ---------------------------------------------------------------------------------------------
   backends:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: verify loki / mimir / tempo configs
         run: |
@@ -172,7 +190,7 @@ jobs:
   compose:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: docker compose config
         # Resolves the full model: YAML, interpolation, anchors, profiles, volume and network refs.
         run: |
@@ -184,7 +202,7 @@ jobs:
   nginx:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: nginx -t on every server config
         # `nginx -t` READS the certs named by ssl_certificate, so a throwaway self-signed pair must
@@ -223,7 +241,7 @@ jobs:
   json-and-provisioning:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: JSON configs and Grafana provisioning parse
         # GRAFANA PROVISIONING FAILS SILENTLY. A malformed datasource or dashboard file is SKIPPED at
@@ -259,7 +277,7 @@ jobs:
   scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: shell-syntax check every script in scripts/
         run: |
@@ -322,11 +340,20 @@ jobs:
           set -euo pipefail
           python3 tests/scripts/test-am-reconcile.py
 
+      - name: service.name shapes outside the Mimir rules
+        # A GATE. The Mimir rules have promtool tests. The collector's tail-sampling environment
+        # policy had none, and it drops a service silently when the name loses its tenant segment.
+        # Reads the REAL collector config, and carries a negative control. Stdlib Python plus
+        # PyYAML, which ships with ubuntu-latest's python3.
+        run: |
+          set -euo pipefail
+          python3 tests/scripts/test-service-name-shapes.py
+
   # ---------------------------------------------------------------------------------------------
   user-data:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: shell-syntax check the EC2 bootstrap template
         # A syntax error here is the worst failure mode in the repo to debug: terraform applies

@@ -16,7 +16,7 @@
       "id": 1,
       "options": {"legend": {"calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"example/dev/demo-service\" && span.context.documentType != \"\"} | rate() by (span.context.documentType)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.context.documentType != \"\"} | rate() by (span.context.documentType)", "refId": "A"}],
       "title": "Documents by Type Over Time",
       "type": "timeseries"
     },
@@ -28,7 +28,7 @@
       "id": 2,
       "options": {"displayLabels": ["name", "percent"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"]}, "pieType": "donut", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"example/dev/demo-service\" && span.context.documentType != \"\"} | count_over_time() by (span.context.documentType)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.context.documentType != \"\"} | count_over_time() by (span.context.documentType)", "refId": "A"}],
       "title": "Document Type Distribution",
       "type": "piechart"
     },
@@ -41,7 +41,7 @@
       "id": 3,
       "options": {"barRadius": 0.05, "barWidth": 0.7, "fullHighlight": false, "groupWidth": 0.7, "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": false}, "orientation": "horizontal", "showValue": "auto", "stacking": "none", "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 0},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"example/dev/demo-service\" && span.context.documentType != \"\"} | avg_over_time(duration) by (span.context.documentType)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.context.documentType != \"\"} | avg_over_time(duration) by (span.context.documentType)", "refId": "A"}],
       "title": "Processing Time by Document Type",
       "type": "barchart"
     },
@@ -53,7 +53,7 @@
       "id": 4,
       "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": []},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"example/dev/demo-service\" && span.context.documentType != \"\"} | quantile_over_time(duration, 0.95) by (span.context.documentType)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.context.documentType != \"\"} | quantile_over_time(duration, 0.95) by (span.context.documentType)", "refId": "A"}],
       "title": "Slowest Document Types (p95)",
       "type": "table"
     },
@@ -66,7 +66,7 @@
       "id": 5,
       "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"example/dev/demo-service\" && span.db.record_count > 0} | count_over_time() by (span.db.record_count)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.db.record_count > 0} | count_over_time() by (span.db.record_count)", "refId": "A"}],
       "title": "Batch Size Distribution",
       "type": "timeseries"
     },
@@ -78,7 +78,7 @@
       "id": 6,
       "options": {"displayLabels": ["name", "value"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"]}, "pieType": "pie", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"example/dev/demo-service\" && span.db.operation != \"\"} | count_over_time() by (span.db.operation)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.db.operation != \"\"} | count_over_time() by (span.db.operation)", "refId": "A"}],
       "title": "Query vs Command Ratio",
       "type": "piechart"
     },
@@ -90,7 +90,7 @@
       "id": 7,
       "options": {"legend": {"calcs": ["mean", "sum"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"example/dev/demo-service\" && span.operation.result_count > 0} | sum_over_time(span.operation.result_count)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.operation.result_count > 0} | sum_over_time(span.operation.result_count)", "refId": "A"}],
       "title": "Result Count Trends",
       "type": "timeseries"
     }

@@ -68,6 +68,35 @@ data:
   {{- ($rules.AsConfig) | nindent 2 }}
 ---
 {{/*
+THE LOKI RULER'S ONLY RULE SOURCE. Same shape as mimir-rules-demo above.
+
+config/loki-config.yaml sets ruler.storage.local.directory=/etc/loki/rules, and Loki's local
+rule store reads <directory>/<tenant>/. So this ConfigMap mounts at /etc/loki/rules/demo,
+exactly as the Compose bind mount does. Loki namespaces rules by FILE NAME, so each key here
+becomes one namespace.
+
+A WRONG MOUNT PATH FAILS SILENTLY. Loki boots, logs "ruler up and running" and loads nothing.
+Verify a deploy with the rules API and the tenant header, never with the pod log:
+  curl -H 'X-Scope-OrgID: demo' http://loki:3100/loki/api/v1/rules
+
+No checksum annotation on the Loki pod for this ConfigMap, for the reason given for Mimir: the
+ruler re-reads the mounted volume every poll_interval, so a rule change needs no restart.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-rules-demo
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "loki") | nindent 4 }}
+data:
+  {{- $lokiRules := .Files.Glob "files/loki/rules/demo/*.yaml" }}
+  {{- if not $lokiRules }}
+  {{- fail "no Loki rule files found in the chart. Run `make -C k8s sync-config`." }}
+  {{- end }}
+  {{- ($lokiRules.AsConfig) | nindent 2 }}
+---
+{{/*
 The Alertmanager tenant config, read by the reconciler Deployment and pushed through
 Mimir's config API. It is NOT mounted into Mimir. The reason is in the Mimir config: the
 Alertmanager keeps its own silences and notification log on object storage, and a

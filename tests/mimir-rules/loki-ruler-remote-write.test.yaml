@@ -1,0 +1,164 @@
+# promtool unit tests for the Loki ruler remote-write alerts:
+# LokiRulerRemoteWriteFailing, LokiRulerNotAppending.
+#
+# MUST NOT live under config/mimir/rules/. That tree is the ruler's rule source (backend=local,
+# mounted :ro and polled every poll_interval), so any .yaml added there is loaded AS RULES.
+#
+# Run:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w:ro" prom/prometheus:v3.1.0 \
+#     test rules /w/tests/mimir-rules/loki-ruler-remote-write.test.yaml
+
+rule_files:
+    - ../../config/mimir/rules/demo/stack-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+    # ---------------------------------------------------------------------------------------
+    # LokiRulerRemoteWriteFailing
+    # ---------------------------------------------------------------------------------------
+
+    # Sustained non-recoverable failures: 1 failed per minute against 10 sent per minute = a 0.1
+    # ratio, ten times the threshold.
+    - interval: 1m
+      input_series:
+          - series: 'loki_ruler_wal_prometheus_remote_storage_samples_failed_total{remote_name="demo-rw-mimir",tenant="demo",url="http://mimir:9009/api/v1/push"}'
+            values: '0+1x90'
+          - series: 'loki_ruler_wal_prometheus_remote_storage_samples_total{remote_name="demo-rw-mimir",tenant="demo",url="http://mimir:9009/api/v1/push"}'
+            values: '0+10x90'
+      alert_rule_test:
+          # for: 15m: not yet firing at 10m.
+          - eval_time: 10m
+            alertname: LokiRulerRemoteWriteFailing
+            exp_alerts: []
+          - eval_time: 40m
+            alertname: LokiRulerRemoteWriteFailing
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                  exp_annotations:
+                      summary: 'The Loki ruler is failing to remote-write its recorded series to Mimir - a 0.100 fraction of samples is being dropped non-recoverably, so stack:loki_ruler_heartbeat:5m and every other Loki-recorded series are incomplete or absent in Mimir'
+                      runbook_url: 'docs/runbooks/loki-ruler-remote-write.md'
+
+    # THE TOTAL-OUTAGE CASE, and the reason the rule is not written as failed/(failed+total).
+    # Every send fails, so the denominator stops climbing while the numerator does not. PromQL
+    # divides by zero and yields +Inf, which is > 0.01. A form that "guarded" the division with
+    # clamp_min would understate this to a finite number, and a form that read the denominator as
+    # the successful count would divide by zero the same way. This case is what keeps either
+    # rewrite honest.
+    - interval: 1m
+      input_series:
+          - series: 'loki_ruler_wal_prometheus_remote_storage_samples_failed_total{remote_name="demo-rw-mimir",tenant="demo",url="http://mimir:9009/api/v1/push"}'
+            values: '0+1x90'
+          - series: 'loki_ruler_wal_prometheus_remote_storage_samples_total{remote_name="demo-rw-mimir",tenant="demo",url="http://mimir:9009/api/v1/push"}'
+            values: '500x90' # flat: nothing is getting through
+      alert_rule_test:
+          - eval_time: 40m
+            alertname: LokiRulerRemoteWriteFailing
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                  exp_annotations:
+                      summary: 'The Loki ruler is failing to remote-write its recorded series to Mimir - a +Inf fraction of samples is being dropped non-recoverably, so stack:loki_ruler_heartbeat:5m and every other Loki-recorded series are incomplete or absent in Mimir'
+                      runbook_url: 'docs/runbooks/loki-ruler-remote-write.md'
+
+    # Healthy: samples flowing, failure counter present and FLAT at zero. Must stay quiet, or the
+    # alert is noise on every healthy stack: which is the state it is in almost all of the time.
+    - interval: 1m
+      input_series:
+          - series: 'loki_ruler_wal_prometheus_remote_storage_samples_failed_total{remote_name="demo-rw-mimir",tenant="demo",url="http://mimir:9009/api/v1/push"}'
+            values: '0x90'
+          - series: 'loki_ruler_wal_prometheus_remote_storage_samples_total{remote_name="demo-rw-mimir",tenant="demo",url="http://mimir:9009/api/v1/push"}'
+            values: '0+10x90'
+      alert_rule_test:
+          - eval_time: 40m
+            alertname: LokiRulerRemoteWriteFailing
+            exp_alerts: []
+
+    # The failure counter ABSENT while sends succeed. Loki registers samples_failed_total at queue
+    # creation (on grafana/loki:3.7.3 it is exposed at 0), so this is the
+    # shape of a collector-filter regression rather than of a healthy ruler. This alert must stay
+    # SILENT here: an absent numerator is not evidence of failure, and it is LokiRulerNotAppending
+    # below that owns "the metric is gone". If both alerts fired on absence, an absent-series
+    # incident would raise two pages with two different first steps.
+    - interval: 1m
+      input_series:
+          - series: 'loki_ruler_wal_prometheus_remote_storage_samples_total{remote_name="demo-rw-mimir",tenant="demo",url="http://mimir:9009/api/v1/push"}'
+            values: '0+10x90'
+      alert_rule_test:
+          - eval_time: 40m
+            alertname: LokiRulerRemoteWriteFailing
+            exp_alerts: []
+
+    # ---------------------------------------------------------------------------------------
+    # LokiRulerNotAppending
+    # ---------------------------------------------------------------------------------------
+
+    # THE REGRESSION GUARD for this whole change. No input series at all: the counter does not
+    # exist, which is exactly what the two collector filters produce when a name is added to only
+    # one of them, or removed from either. A rule written as `increase(...) == 0` alone matches
+    # NOTHING here and would stay silent through the failure it was written for. If someone
+    # "simplifies" the absent() branch away, this case fails and tells them why.
+    - interval: 1m
+      input_series: []
+      alert_rule_test:
+          # for: 30m: not yet firing at 20m.
+          - eval_time: 20m
+            alertname: LokiRulerNotAppending
+            exp_alerts: []
+          - eval_time: 40m
+            alertname: LokiRulerNotAppending
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                  exp_annotations:
+                      summary: 'The Loki ruler has appended NO samples for 2h (or the counter is absent entirely) - either the ruler stopped evaluating its rules, or Loki has received no logs at all; both are incidents and stack:loki_ruler_heartbeat:5m is going stale in Mimir either way'
+                      runbook_url: 'docs/runbooks/loki-ruler-remote-write.md'
+
+    # The series exists and has gone FLAT: the ruler is up, the counter is being scraped, and no
+    # rule has appended a sample. absent() is empty here, so this case is carried entirely by the
+    # increase() branch. Both branches are needed and neither covers the other.
+    - interval: 1m
+      input_series:
+          - series: 'loki_ruler_wal_samples_appended_total{tenant="demo"}'
+            values: '4200x200'
+      alert_rule_test:
+          - eval_time: 180m
+            alertname: LokiRulerNotAppending
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                  exp_annotations:
+                      summary: 'The Loki ruler has appended NO samples for 2h (or the counter is absent entirely) - either the ruler stopped evaluating its rules, or Loki has received no logs at all; both are incidents and stack:loki_ruler_heartbeat:5m is going stale in Mimir either way'
+                      runbook_url: 'docs/runbooks/loki-ruler-remote-write.md'
+
+    # Healthy: one append per minute, the ruler's actual cadence. Must stay quiet.
+    - interval: 1m
+      input_series:
+          - series: 'loki_ruler_wal_samples_appended_total{tenant="demo"}'
+            values: '0+1x200'
+      alert_rule_test:
+          - eval_time: 180m
+            alertname: LokiRulerNotAppending
+            exp_alerts: []
+
+    # THE FALSE-POSITIVE GUARD, and the case that fails if the 2h window is narrowed. The
+    # heartbeat rule is sum(count_over_time(...[5m])), and sum() over no matching lines returns an
+    # EMPTY vector: so a quiet stack appends NOTHING for the quiet stretch, legitimately. Modelled
+    # here as a 45m append cadence over 4h. With a 15m or 30m lookback the window is empty for
+    # longer than the 30m `for:` and this fires with nothing wrong. At 2h it stays silent.
+    # This case PASSES with a narrowed window only if you also delete it.
+    - interval: 1m
+      input_series:
+          # steps at t=10, 55, 100, 145, 190, 235: an early append, then a 45m cadence
+          - series: 'loki_ruler_wal_samples_appended_total{tenant="demo"}'
+            values: '1x9 2x44 3x44 4x44 5x44 6x44 7x30'
+      alert_rule_test:
+          # t=140m sits 40m after the t=100 append and 5m before the next: the deepest point of
+          # a flat stretch, and where a 15m-window version has already been true for 25m.
+          - eval_time: 140m
+            alertname: LokiRulerNotAppending
+            exp_alerts: []
+          - eval_time: 230m
+            alertname: LokiRulerNotAppending
+            exp_alerts: []

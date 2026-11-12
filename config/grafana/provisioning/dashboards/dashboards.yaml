@@ -1,4 +1,19 @@
 # Dashboard provisioning configuration
+#
+# allowUiUpdates is FALSE on every provider. Git is the deploy for dashboards, the same contract
+# the Mimir ruler already has (ruler_storage.backend=local + read-only bind mount, and nginx blocks
+# the ruler write path at the edge).
+#
+# What `true` actually did, and why it is worse than it sounds: Grafana does NOT re-apply a
+# provisioned file on every poll. It compares the file against the stored version, so a dashboard
+# edited and saved in the UI KEEPS that edit until the file changes - and then loses it without
+# warning. The divergence is invisible while it lasts and the loss is silent when it ends, so the
+# person who made the edit finds out only when their panel is gone. `false` makes Grafana refuse
+# the save in the first place, which is a visible failure at the moment of the mistake.
+#
+# Consequence to accept: the Edit and Save controls are gone for every dashboard under these
+# three providers. Change a dashboard by editing its JSON here and merging. To iterate
+# interactively, use "Save As" to make an unmanaged copy, or Explore.
 
 apiVersion: 1
 
@@ -10,7 +25,7 @@ providers:
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10
-    allowUiUpdates: true
+    allowUiUpdates: false
     options:
       path: /etc/grafana/provisioning/dashboards/demo-service
 
@@ -23,7 +38,7 @@ providers:
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10
-    allowUiUpdates: true
+    allowUiUpdates: false
     options:
       path: /etc/grafana/provisioning/dashboards/lgtm-health
 
@@ -36,6 +51,6 @@ providers:
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10
-    allowUiUpdates: true
+    allowUiUpdates: false
     options:
       path: /etc/grafana/provisioning/dashboards/services

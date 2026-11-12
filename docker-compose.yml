@@ -76,6 +76,20 @@ services:
     volumes:
       - ./config/loki-config.yaml:/etc/loki/config.yaml
       - loki-data:/tmp/loki # Mount persistent data volume
+      # Git-backed ruler rules, READ-ONLY, the same pattern as the Mimir ruler's mount.
+      #
+      # `:ro` is the part that matters. Loki keeps `ruler.enable_api: true` for its READ endpoints
+      # (/loki/api/v1/rules is the only honest way to verify a deploy), and the read-only mount is
+      # what makes the config API refuse a WRITE. Drop the `:ro` and the API can accept a
+      # hand-written rule that exists nowhere in git.
+      #
+      # The `demo/` subdirectory inside is REQUIRED: Loki's local rule store reads
+      # <directory>/<tenant>/, and a flat layout loads nothing while the ruler still reports
+      # "up and running". See the ruler block in config/loki-config.yaml.
+      #
+      # This is a DIRECTORY mount, so `git pull` deploys a rule change. A single-file mount would
+      # pin the inode; see the mimir-am-init note below.
+      - ./config/loki/rules:/etc/loki/rules:ro
     command: -config.file=/etc/loki/config.yaml
     networks:
       - lgtm-net
@@ -263,10 +277,24 @@ services:
   #
   # WHY IT IS LONG-RUNNING RATHER THAN ONE-SHOT. A one-shot loader makes `git pull` deploy HALF a
   # commit: the ruler picks new rules off its bind mount within poll_interval, while the Alertmanager
-  # config sits unchanged until somebody re-runs the container. Long-running restores the symmetry —
-  # and because the mount below is the live host file, a `git pull` alone now deploys both planes.
-  # It also means an out-of-band write is REVERTED within one interval instead of surviving
-  # indefinitely. See scripts/init-mimir-alertmanager.sh and docs/runbooks/alert-delivery-silent.md.
+  # config sits unchanged until somebody re-runs the container. Long-running restores the symmetry
+  # for OUT-OF-BAND DRIFT: an API write to the tenant config is REVERTED within one interval instead
+  # of surviving indefinitely. See scripts/init-mimir-alertmanager.sh and
+  # docs/runbooks/alert-delivery-silent.md.
+  #
+  # A `git pull` DOES NOT DEPLOY A CHANGE TO demo-am.yaml ITSELF. Read this before you change it.
+  # The mount below is a SINGLE-FILE bind mount, which pins the inode. `git pull` writes a new file
+  # and renames it over the old one, so the container keeps reading the PRE-PULL inode. The
+  # reconciler then compares the live config against that stale file, finds no drift, and logs
+  # `verified: ... config is live`: healthy output while the old config serves. Compare the host
+  # file and the in-container file (`stat -c '%s %i'` on both) and the size and inode differ.
+  #
+  # `docker restart mimir-am-init` DOES NOT FIX IT: same container, same pinned inode. Recreate it
+  # so the mount re-resolves:
+  #     docker-compose up -d --force-recreate --no-deps mimir-am-init
+  # Then verify against MIMIR, never against this container's log:
+  #     docker exec mimir-am-init curl -sf -H "X-Scope-OrgID: demo" \
+  #       http://mimir:9009/api/v1/alerts | grep -c <a string only your change introduces>
   #
   # Reuses Dockerfile.grafana-init purely for its toolchain (bash, curl, jq); no new base image.
   # depends_on is start-only, because mimir has no healthcheck; the script polls /ready itself.

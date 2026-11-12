@@ -1,0 +1,43 @@
+# Loki ruler liveness.
+#
+# WHY THIS FILE EXISTS. A recording rule over a rare log event can legitimately produce no samples
+# for days. Such a rule is INDISTINGUISHABLE from a rule whose remote_write is broken: both give
+# an empty query in Mimir. Without one rule that always produces a sample, "the recorded series is
+# queryable in Mimir" cannot be verified at all, not on the day the ruler ships and not the next
+# time someone doubts the pipeline.
+#
+# This rule is that instrument. It counts log lines, so it is non-zero whenever ANY log flows,
+# which makes the whole chain provable end to end:
+#   rules file on disk -> ruler loads it -> evaluates -> remote_write -> Mimir -> queryable
+#
+# Reading it:
+#   ABSENT in Mimir  -> the wiring is broken (the ruler did not load it, or remote_write fails)
+#   PRESENT and > 0  -> the whole chain works; an empty series from another rule is then real
+#   PRESENT and 0    -> the chain works and Loki receives nothing, which is its own incident
+#
+# The last line is why this is a count and not a constant: a constant would prove the ruler runs
+# and say nothing about Loki. It measures the RULER's view of ingest and is deliberately NOT an
+# alert. Alerting lives in config/mimir/rules/demo/, where promtool `check rules` and `test rules`
+# gate it (see LokiRulerRemoteWriteFailing and LokiRulerNotAppending in stack-alerts.yaml), and the
+# alertmanager_url decision in config/loki-config.yaml explains why.
+groups:
+  - name: loki-ruler-liveness
+    # Matches the ruler's poll_interval, so a reload and an evaluation share one cadence.
+    interval: 1m
+    rules:
+      # Naming follows config/mimir/rules/demo/: <level>:<measure>:<window>. Level `stack`,
+      # because this describes the observability stack, not an application service.
+      - record: stack:loki_ruler_heartbeat:5m
+        # `{service_name=~".+"}` is every stream that carries a service_name index label, that is
+        # all application logs in every tenant and environment. One evaluation reads five minutes
+        # of logs, which is cheap at a 1m cadence on a stack this size; re-measure on a large one.
+        #
+        # Deliberately UNGROUPED: one series, no labels. This is a liveness bit. A per-service
+        # breakdown would duplicate what Loki's own /metrics exposes at higher fidelity, and add
+        # cardinality in Mimir for no decision anyone makes.
+        expr: sum(count_over_time({service_name=~".+"}[5m]))
+        labels:
+          # Marks the producer, so `{source="loki-ruler"}` in Mimir shows everything this ruler
+          # writes. Both rulers write into the same tenant, and without the label a Loki-recorded
+          # series cannot be told from a Mimir-recorded one.
+          source: loki-ruler

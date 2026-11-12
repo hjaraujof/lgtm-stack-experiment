@@ -53,7 +53,7 @@ jobs:
   chart:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
 
       - name: the chart copy must match config/ and scripts/
@@ -129,7 +129,7 @@ jobs:
     # the YAML inside a ConfigMap still loads. These are the bytes a pod will read.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
 
       - name: extract the rendered configs
@@ -218,8 +218,8 @@ jobs:
     # repository's .terraform.lock.hcl already records.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: opentofu/setup-opentofu@v1
+      - uses: actions/checkout@v7
+      - uses: opentofu/setup-opentofu@v2
 
       - name: fmt, init and validate BOTH identity paths
         # Validating only the default would leave the IRSA branch - an OIDC provider and a
@@ -238,7 +238,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: shellcheck the k8s helper scripts
         # A GATE, not advisory. config-check.yml covers scripts/; these live in k8s/scripts/

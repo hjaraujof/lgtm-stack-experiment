@@ -10,7 +10,10 @@
 # `<tenant>/<env>/<component>`, for example `tenant-a/prod/orders-api`. That compound name is the
 # ONLY env-bearing label on the span metrics, because the apps here do not set the
 # `service.namespace` resource attribute. Alerts that must page only for live traffic therefore
-# select the env with a regex on the middle segment: `service_name=~"[^/]+/(prod|uat)/[^/]+"`.
+# select the env with a regex on the env segment: `service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"`.
+# The tenant segment is OPTIONAL, so the two-segment `<env>/<component>` (for example
+# `prod/orders-api`) matches too. A service that drops its tenant segment must not silently leave
+# every live alert and env:* recording; tests/mimir-rules/two-segment-service-name.test.yaml pins that.
 # If your services do not use this convention, replace that regex everywhere it appears.
 #
 # WHY pre-production envs are excluded from live paging: a qa env is expected-noisy, and a dev env
@@ -38,7 +41,7 @@ groups:
       # slo-burn.yaml for the full derivation, and for why a status-code numerator is immune to the
       # benign-internal-error floor that every span-status ratio carries.
       - alert: HighServiceErrorRatio
-        expr: service:http_5xx_ratio:5m{service_name=~"[^/]+/(prod|uat)/[^/]+"} > 0.05
+        expr: service:http_5xx_ratio:5m{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"} > 0.05
         for: 5m
         labels: {severity: warning}
         annotations:
@@ -70,13 +73,13 @@ groups:
         expr: |
           (
             sum by (service_name, span_name) (
-              increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR",service_name=~"[^/]+/(prod|uat)/[^/]+"}[5m])
+              increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR",service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[5m])
             ) > 5
           )
           unless
           (
             sum by (service_name, span_name) (
-              increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code!="STATUS_CODE_ERROR",service_name=~"[^/]+/(prod|uat)/[^/]+"}[5m])
+              increase(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code!="STATUS_CODE_ERROR",service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[5m])
             ) > 0
           )
         for: 15m
@@ -119,8 +122,8 @@ groups:
       # this alert would NEVER latch under a plain `== 0` with `for: 10m`.
       - alert: ProdSpanMetricsPipelineSilent
         expr: |
-          sum(rate(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])) == 0
-            or absent_over_time(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])
+          sum(rate(traces_span_metrics_calls_total{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[10m])) == 0
+            or absent_over_time(traces_span_metrics_calls_total{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[10m])
         for: 3m
         labels: {severity: critical}
         annotations:
@@ -159,8 +162,8 @@ groups:
           runbook_url: 'docs/runbooks/pipeline-silent.md'
       - alert: ProdSpanMetricsPipelineImplausiblyLow
         expr: |
-          sum(rate(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])) > 0
-            and sum(rate(traces_span_metrics_calls_total{service_name=~"[^/]+/(prod|uat)/[^/]+"}[10m])) < 2
+          sum(rate(traces_span_metrics_calls_total{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[10m])) > 0
+            and sum(rate(traces_span_metrics_calls_total{service_name=~"(?:[^/]+/)?(prod|uat)/[^/]+"}[10m])) < 2
         for: 30m
         labels: {severity: warning}
         annotations:
@@ -441,6 +444,72 @@ groups:
         annotations:
           summary: 'Loki is discarding log entries on tenant {{ $labels.tenant }} (reason={{ $labels.reason }}) at {{ $value | printf "%.2f" }}/s - these entries are permanently lost'
           runbook_url: 'docs/runbooks/loki-discards.md'
+
+      # --- Loki ruler remote-write to Mimir ---
+      # The Loki ruler has a remote_write client (config/loki-config.yaml `ruler.remote_write`), so
+      # the series its recording rules produce reach Mimir. These two alerts watch that write. The
+      # counters exist only on Loki's own /metrics, so the collector relays them: see the
+      # loki_ruler_wal_* names in config/otel-collector-config.yaml, in BOTH the loki-internal
+      # scrape's keep regex and the filter/internal_metrics allowlist. A name in only one of the two
+      # keeps nothing.
+      #
+      # TWO alerts, because "the recorded series is missing from Mimir" has two causes that need
+      # different responses and look identical from the series itself:
+      #   remote-write is failing        -> the ruler evaluates fine, the samples do not land
+      #   the ruler stopped evaluating   -> there are no samples to send in the first place
+      # One alert for both would say "something is wrong with the Loki ruler" and send the responder
+      # to read the same empty graph that raised it.
+      #
+      # A RATIO, not a raw count. A count alone cannot tell one permanently dropped sample from a
+      # total outage, and the two want different urgency. The denominator relationship is NOT relied
+      # upon: whether samples_total includes the failures or excludes them, a total outage gives a
+      # ratio of 1 or of +Inf (division by zero in PromQL), and both exceed the threshold. Do not
+      # "fix" this to failed/(failed+total) without measuring which it is.
+      #
+      # NOT `> 0` on the counter and NOT `== 0`. samples_failed_total counts NON-recoverable sends.
+      # Recoverable ones are retried, so every increment here is a recorded sample that is lost for
+      # good. At the heartbeat rule's 1-sample/min cadence, one lost sample is 1/15 of a 15m window,
+      # so this does fire on one. That is deliberate: the series it protects is a liveness
+      # instrument, and a silent hole in it is the failure this alert exists to surface.
+      - alert: LokiRulerRemoteWriteFailing
+        expr: |
+          sum(rate(loki_ruler_wal_prometheus_remote_storage_samples_failed_total[15m]))
+          /
+          sum(rate(loki_ruler_wal_prometheus_remote_storage_samples_total[15m]))
+          > 0.01
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'The Loki ruler is failing to remote-write its recorded series to Mimir - a {{ $value | printf "%.3f" }} fraction of samples is being dropped non-recoverably, so stack:loki_ruler_heartbeat:5m and every other Loki-recorded series are incomplete or absent in Mimir'
+          runbook_url: 'docs/runbooks/loki-ruler-remote-write.md'
+
+      # The other half. `absent()` is load-bearing and carries the case this alert exists for: if
+      # the ruler never starts, or a collector filter edit drops the metric again, the series does
+      # not EXIST and every `== 0` / `< N` form matches nothing. The same trap is described on the
+      # alert-path integrity alerts below.
+      #
+      # THE WINDOW IS 2h AGAINST A 1m CADENCE, and the margin is deliberate. The ruler group
+      # interval is 1m (config/loki/rules/demo/ruler-heartbeat.yaml), but the heartbeat rule is
+      # `sum(count_over_time({service_name=~".+"}[5m]))`, and sum() over NO matching lines returns
+      # an EMPTY vector. So a stretch with no logs at all appends nothing, and that is legitimate.
+      # A 15m window would page on a quiet evening. At 2h it tolerates 120x the append cadence.
+      # Worst-case detection is 2h30m. That is acceptable, because the failure it describes is a
+      # missing recording rule, not a customer-facing outage.
+      #
+      # What this alert deliberately does NOT separate: "the ruler stopped evaluating" and "Loki
+      # received no logs for 2h". Both are incidents, both need the same first step (read
+      # /loki/api/v1/rules with X-Scope-OrgID: demo), and to separate them would need a second
+      # constant-valued rule whose only reader is this alert.
+      - alert: LokiRulerNotAppending
+        expr: |
+          absent(loki_ruler_wal_samples_appended_total)
+          or
+          sum(increase(loki_ruler_wal_samples_appended_total[2h])) == 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: 'The Loki ruler has appended NO samples for 2h (or the counter is absent entirely) - either the ruler stopped evaluating its rules, or Loki has received no logs at all; both are incidents and stack:loki_ruler_heartbeat:5m is going stale in Mimir either way'
+          runbook_url: 'docs/runbooks/loki-ruler-remote-write.md'
 
       # --- Alert-path integrity ---
       #

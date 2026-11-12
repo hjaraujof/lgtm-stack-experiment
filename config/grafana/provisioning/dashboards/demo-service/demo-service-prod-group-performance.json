@@ -16,7 +16,7 @@
       "id": 1,
       "options": {"legend": {"calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-b/prod/demo-service\" && span.context.groups != \"\"} | rate() by (span.context.groups)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-b/)?prod/demo-service$\" && span.context.groups != \"\"} | rate() by (span.context.groups)", "refId": "A"}],
       "title": "Request Volume by Group",
       "type": "timeseries"
     },
@@ -28,7 +28,7 @@
       "id": 2,
       "options": {"displayLabels": ["name", "percent"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value", "percent"]}, "pieType": "donut", "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false}, "tooltip": {"hideZeros": false, "mode": "single", "sort": "none"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-b/prod/demo-service\" && span.context.appName != \"\"} | count_over_time() by (span.context.appName)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-b/)?prod/demo-service$\" && span.context.appName != \"\"} | count_over_time() by (span.context.appName)", "refId": "A"}],
       "title": "Volume by Application",
       "type": "piechart"
     },
@@ -41,7 +41,7 @@
       "id": 3,
       "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-b/prod/demo-service\" && span.context.groups != \"\"} | avg_over_time(duration) by (span.context.groups)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-b/)?prod/demo-service$\" && span.context.groups != \"\"} | avg_over_time(duration) by (span.context.groups)", "refId": "A"}],
       "title": "Latency by Group",
       "type": "timeseries"
     },
@@ -53,7 +53,7 @@
       "id": 4,
       "options": {"legend": {"calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-b/prod/demo-service\" && span.context.groups != \"\" && status = error} | rate() by (span.context.groups)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-b/)?prod/demo-service$\" && span.context.groups != \"\" && status = error} | rate() by (span.context.groups)", "refId": "A"}],
       "title": "Error Rate by Group",
       "type": "timeseries"
     },
@@ -66,7 +66,7 @@
       "id": 5,
       "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": []},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-b/prod/demo-service\" && span.context.groups != \"\" && span.context.documentType != \"\"} | count_over_time() by (span.context.groups, span.context.documentType)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-b/)?prod/demo-service$\" && span.context.groups != \"\" && span.context.documentType != \"\"} | count_over_time() by (span.context.groups, span.context.documentType)", "refId": "A"}],
       "title": "Document Types per Group",
       "type": "table"
     },
@@ -78,7 +78,7 @@
       "id": 6,
       "options": {"barRadius": 0.05, "barWidth": 0.7, "fullHighlight": false, "groupWidth": 0.7, "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "orientation": "horizontal", "showValue": "auto", "stacking": "normal", "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 0},
       "pluginVersion": "11.3.1",
-      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name = \"tenant-b/prod/demo-service\" && span.context.groups != \"\" && span.db.operation != \"\"} | count_over_time() by (span.context.groups, span.db.operation)", "refId": "A"}],
+      "targets": [{"datasource": {"type": "tempo", "uid": "tempo"}, "queryType": "traceql", "query": "{resource.service.name =~ \"^(tenant-b/)?prod/demo-service$\" && span.context.groups != \"\" && span.db.operation != \"\"} | count_over_time() by (span.context.groups, span.db.operation)", "refId": "A"}],
       "title": "Operations Breakdown per Group",
       "type": "barchart"
     }

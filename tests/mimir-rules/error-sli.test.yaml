@@ -157,8 +157,27 @@ tests:
             values: '0+100x200'
       promql_expr_test:
           # No series at all - NOT a 0. A 0 would read as "measured, and fine".
+          #
+          # All four windows are asserted, not just 30m. The `or (denominator * 0)` term on the
+          # numerator makes a HEALTHY service record a real 0 (see the next case), and the point is
+          # that it must NOT do so here. The denominator vector is empty for a service with no status
+          # codes, so `empty * 0` is empty and the `or` adds nothing. If someone "simplifies" that term
+          # to a bare `or vector(0)`, every one of these starts returning 0 and this service silently
+          # becomes a false green.
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:5m{service_name="tenant-a/prod/web-app"}
+            exp_samples: []
           - eval_time: 90m
             expr: service:http_5xx_ratio:30m{service_name="tenant-a/prod/web-app"}
+            exp_samples: []
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:1h{service_name="tenant-a/prod/web-app"}
+            exp_samples: []
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:6h{service_name="tenant-a/prod/web-app"}
+            exp_samples: []
+          - eval_time: 90m
+            expr: service:http_auth_fail_ratio:30m{service_name="tenant-a/prod/web-app"}
             exp_samples: []
       alert_rule_test:
           - eval_time: 90m
@@ -180,14 +199,64 @@ tests:
     # ---------------------------------------------------------------------------------------
     # The tripwire must NOT fire for a service that does emit status codes - otherwise it pages for
     # every healthy service in the fleet.
+    #
+    # ALSO THE HEALTHY-ZERO GUARD. This service emits status codes and has never returned a 5xx or a
+    # 401, which is the ordinary state of most services. It must record a REAL 0 on every window.
+    #
+    # Without the `or (denominator * 0)` term the numerator selector has no series at all until a
+    # first failure, so the binary operator drops the whole expression and these five recordings are
+    # ABSENT. "Blank" then means healthy, never yet failed, or not measurable, with no way to tell
+    # them apart.
+    #
+    # If this case regresses to exp_samples: [] the alerts still behave, so nothing pages and nothing
+    # looks wrong. Only the READ path breaks. That is precisely why it needs a test.
     # ---------------------------------------------------------------------------------------
     - interval: 1m
       input_series:
           - series: 'traces_span_metrics_calls_total{service_name="tenant-b/prod/inventory-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
             values: '0+100x200'
+      promql_expr_test:
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:5m{service_name="tenant-b/prod/inventory-api"}
+            exp_samples:
+                - labels: 'service:http_5xx_ratio:5m{service_name="tenant-b/prod/inventory-api"}'
+                  value: 0
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:30m{service_name="tenant-b/prod/inventory-api"}
+            exp_samples:
+                - labels: 'service:http_5xx_ratio:30m{service_name="tenant-b/prod/inventory-api"}'
+                  value: 0
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:1h{service_name="tenant-b/prod/inventory-api"}
+            exp_samples:
+                - labels: 'service:http_5xx_ratio:1h{service_name="tenant-b/prod/inventory-api"}'
+                  value: 0
+          - eval_time: 90m
+            expr: service:http_5xx_ratio:6h{service_name="tenant-b/prod/inventory-api"}
+            exp_samples:
+                - labels: 'service:http_5xx_ratio:6h{service_name="tenant-b/prod/inventory-api"}'
+                  value: 0
+          - eval_time: 90m
+            expr: service:http_auth_fail_ratio:30m{service_name="tenant-b/prod/inventory-api"}
+            exp_samples:
+                - labels: 'service:http_auth_fail_ratio:30m{service_name="tenant-b/prod/inventory-api"}'
+                  value: 0
       alert_rule_test:
           - eval_time: 90m
             alertname: ServiceAvailabilitySLIUnmeasurable
+            exp_alerts: []
+          # A recorded 0 must not page. This is the whole safety argument for the change.
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetSlowBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: ServiceAuthFailureRateHigh
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
             exp_alerts: []
 
     # ---------------------------------------------------------------------------------------

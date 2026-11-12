@@ -12,6 +12,12 @@
 # Every Loki DATA-PATH client must therefore send X-Scope-OrgID: the collector
 # exporter does, and the Grafana Loki datasource does through httpHeaderName1.
 # Admin endpoints (/ready, /metrics) stay tenant-free.
+#
+# The RULER is a tenant-scoped client too. Its rules live under the `demo` subdirectory of the
+# rules mount, and it stamps that same tenant onto every remote-write to Mimir. A query to
+# /loki/api/v1/rules therefore NEEDS `X-Scope-OrgID: demo`. Without the header the request
+# resolves to a different tenant and returns nothing, which looks exactly like a failed deploy.
+# See the ruler block at the bottom of this file.
 auth_enabled: true
 
 server:
@@ -154,17 +160,91 @@ limits_config:
   max_structured_metadata_size: 256KB
 
 # --- Ruler (Alerting) ---
+# --- Ruler (recording rules -> Mimir) ---
+#
+# The rule SOURCE is a git-backed, read-only bind mount, and the ruler remote-writes the series it
+# records to Mimir. Without remote-write the ruler can evaluate a rule but has nowhere to put the
+# result, so a numeric log field can never become a series that a Mimir alert can watch.
+#
+# The old `directory: /tmp/loki/rules` was not ephemeral: /tmp/loki is the named `loki-data`
+# volume, so hand-loaded rules survived a restart. The defect was that there was no DEPLOY PATH.
+# A rule reached the ruler only by hand, and `enable_api: true` over a WRITABLE local backend let
+# the config API accept a rule that existed nowhere in git. The Mimir ruler's `:ro` mount exists
+# to prevent the same drift.
+#
+# The read-only mount is what disables writes, NOT `enable_api`. `enable_api` stays true for the
+# read endpoints: /loki/api/v1/rules is the only honest way to verify a deploy landed, because a
+# rules directory Loki cannot read does NOT stop it booting (see the layout note below).
 ruler:
+  # Deliberately EMPTY: Loki-native alerting is not wired.
+  #   1. The rules here are RECORDING rules. A recording rule never notifies.
+  #   2. Alerting already has one owner: the Mimir ruler plus the Mimir Alertmanager, whose tenant
+  #      config is git-backed and drift-reconciled by scripts/init-mimir-alertmanager.sh. Pointing
+  #      Loki's ruler at the same Alertmanager makes a SECOND alert producer with no reconciler and
+  #      no unit tests, and two places to look when something did not page.
+  #   3. An alert on a series recorded here belongs in config/mimir/rules/demo/, where promtool
+  #      `check rules` AND `test rules` gate it. A Loki-native alert bypasses both.
   alertmanager_url: ''
   ring:
     kvstore:
       store: inmemory
+  # Working dir where the ruler MAPS each tenant's rules before it evaluates them. This is NOT the
+  # rule source, which is `storage.local.directory` below. Do not point the two at the same path.
+  # It stays on the named volume (writable).
   rule_path: /tmp/loki/rules-temp
   storage:
     type: local
     local:
-      directory: /tmp/loki/rules
+      # The git-backed, READ-ONLY bind mount (docker-compose.yml: ./config/loki/rules -> here).
+      # `git pull` is the deploy.
+      #
+      # THE LAYOUT IS NOT OPTIONAL AND IT FAILS SILENTLY. Loki's local rule store reads
+      # <directory>/<tenant>/, so rules MUST live in config/loki/rules/demo/ (tenant `demo`,
+      # matching auth_enabled above and the collector's X-Scope-OrgID). Run both layouts on
+      # grafana/loki:3.7.3 and you get:
+      #   - rules/demo/rule.yaml -> /loki/api/v1/rules lists the group
+      #   - rules/rule.yaml      -> "unable to read rule dir /etc/loki/rules/demo: no such file or
+      #                             directory" from the API, while the ruler STILL logs "ruler up
+      #                             and running" with no error
+      # A wrong layout does not crash Loki. It loads nothing and looks healthy. That is why
+      # .github/workflows/loki-rules-check.yml boots Loki and asserts the rules API.
+      #
+      # Loki namespaces rules by FILE NAME, where Mimir namespaces by subdirectory. The directory
+      # shape matches config/mimir/rules/ on purpose; the namespace semantics differ.
+      directory: /etc/loki/rules
   enable_api: true
+  # Already Loki's own default (`-ruler.poll-interval` defaults to 1m0s). Stated explicitly
+  # because the Mimir ruler has to OVERRIDE its 10m default to reach the same 1m, and a reader who
+  # compares the two configs should not have to guess whether the omission was deliberate. 1m is
+  # what makes `git pull` observable and removes the temptation to hand-load.
+  poll_interval: 1m
+  # Loki's default is `ruler-wal`, a RELATIVE path resolved against the process working directory,
+  # which is NOT on the persistent volume. remote_write buffers through this WAL, so a relative
+  # path puts the send queue somewhere that vanishes on recreate. Pin it to the named volume. Each
+  # tenant gets its own directory one level below.
+  wal:
+    dir: /tmp/loki/ruler-wal
+  remote_write:
+    enabled: true
+    clients:
+      # Same endpoint and network name as the collector's prometheusremotewrite/mimir exporter
+      # (config/otel-collector-config.yaml). The container name, not localhost: the ruler runs in
+      # the loki container, not the mimir one.
+      mimir:
+        url: http://mimir:9009/api/v1/push
+        # NO explicit X-Scope-OrgID here, on purpose. `-ruler.remote-write.add-org-id-header`
+        # defaults to TRUE (see the 3.7.3 binary's own -help), so Loki sets X-Scope-OrgID to the
+        # TENANT THE RULE BELONGS TO: `demo`, from the rules subdirectory name. A hard-coded header
+        # would be a second source of truth for the tenant, and would silently disagree with the
+        # directory name the day someone adds another tenant.
+        queue_config:
+          # Small stack, few rules. A modest queue stops a Mimir outage from growing the loki
+          # container's memory; the WAL above keeps samples across a restart.
+          capacity: 2500
+          max_shards: 10
+          min_shards: 1
+          max_samples_per_send: 500
+          batch_send_deadline: 5s
 
   # pattern_ingester: # Invalid block here
   #   enabled: true

@@ -134,7 +134,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\"} | rate()",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\"} | rate()",
           "refId": "A"
         }
       ],
@@ -204,7 +204,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\" && status = error} | rate()",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && status = error} | rate()",
           "refId": "A"
         }
       ],
@@ -274,7 +274,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\" && status = error} | count_over_time()",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && status = error} | count_over_time()",
           "refId": "A"
         }
       ],
@@ -430,7 +430,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\"} | quantile_over_time(duration, 0.5, 0.95, 0.99)",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\"} | quantile_over_time(duration, 0.5, 0.95, 0.99)",
           "refId": "A"
         }
       ],
@@ -524,7 +524,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\"} | histogram_over_time(duration)",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\"} | histogram_over_time(duration)",
           "refId": "A"
         }
       ],
@@ -628,7 +628,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\" && name != \"\"} | count_over_time() by (name) | topk(10)",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && name != \"\"} | count_over_time() by (name) | topk(10)",
           "refId": "A"
         }
       ],
@@ -756,7 +756,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\" && span.operation.status != \"\"} | count_over_time() by (span.operation.status)",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.operation.status != \"\"} | count_over_time() by (span.operation.status)",
           "refId": "A"
         }
       ],
@@ -823,7 +823,7 @@
             "uid": "tempo"
           },
           "queryType": "traceql",
-          "query": "{resource.service.name = \"example/dev/demo-service\" && span.http.status_code != \"\"} | count_over_time() by (span.http.status_code)",
+          "query": "{resource.service.name =~ \"^(example/)?dev/demo-service$\" && span.http.status_code != \"\"} | count_over_time() by (span.http.status_code)",
           "refId": "A"
         }
       ],

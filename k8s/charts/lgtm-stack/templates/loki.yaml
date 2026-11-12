@@ -89,14 +89,27 @@ spec:
           resources:
             {{- toYaml .Values.loki.resources | nindent 12 }}
           volumeMounts:
+            # subPath, not the whole /etc/loki directory: the rules ConfigMap mounts BELOW
+            # /etc/loki, and a mount nested inside another ConfigMap volume is fragile. Mimir
+            # mounts its config and rules the same way. A subPath file does not follow ConfigMap
+            # updates, which is fine here: the checksum annotation above rolls the pod instead.
             - name: config
-              mountPath: /etc/loki
+              mountPath: /etc/loki/config.yaml
+              subPath: config.yaml
+            # The ruler's rule source, read-only, at <ruler.storage.local.directory>/<tenant>.
+            # See loki-rules-demo in configmap-backends.yaml.
+            - name: rules
+              mountPath: /etc/loki/rules/demo
+              readOnly: true
             - name: data
               mountPath: /tmp/loki
       volumes:
         - name: config
           configMap:
             name: loki-config
+        - name: rules
+          configMap:
+            name: loki-rules-demo
   volumeClaimTemplates:
     - metadata:
         name: data

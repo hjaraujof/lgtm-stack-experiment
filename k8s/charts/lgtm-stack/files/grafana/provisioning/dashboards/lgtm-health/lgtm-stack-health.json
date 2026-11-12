@@ -40,7 +40,7 @@
         "type": "prometheus",
         "uid": "Mimir-Prometheus"
       },
-      "description": "Span-metrics call rate from the collector connectors. 0 for 10m fires SpanMetricsPipelineSilent (traces pipeline down).",
+      "description": "Span-metrics call rate from the collector connectors. 0 for 10m fires SpanMetricsPipelineSilent (traces pipeline down). NOT true request volume when your applications head-sample: a service that samples at N% in the APP sends spans at N% of real traffic, and the collector cannot recover the rest. Use this for liveness and for rates and ratios (unbiased), never as an absolute count.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -332,7 +332,7 @@
         "type": "prometheus",
         "uid": "Mimir-Prometheus"
       },
-      "description": "Tempo compaction backlog. >50 for 15m = TempoCompactionStalled (S3 compactor stall).",
+      "description": "Tempo compaction backlog. >50 for 15m = TempoCompactionStalled (S3 compactor stall). The dashed line IS that 50-block alert limit. thresholdsStyle is set explicitly: this panel colours by palette-classic, and under that colour mode a threshold step paints nothing, so without it the step is defined and invisible - the panel shows a backlog number with no indication of how close it is to paging. axisSoftMax keeps the limit on screen when the backlog is near zero.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -766,6 +766,358 @@
       ],
       "title": "Exporter send failures (the hop after the receiver)",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "id": 103,
+      "panels": [],
+      "title": "Loki (log ingest + ruler remote-write)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Loki discards log entries PER ENTRY: an oversized entry is dropped and counted here, the rest of the push is ingested, and the whole request still answers 400. That partial-success shape lets a discard run unnoticed for a long time - the service keeps logging while a large share of its entries are dropped. Unscoped by reason on purpose: scoping to the one reason seen so far is how the next reason arrives silently. A HEALTHY 0 MUST STILL BE VISIBLE, so axisSoftMin is negative - with min:0 a series at exactly 0 draws on the axis floor, is clipped, and the panel reads as EMPTY, which is indistinguishable from no-data. Alert: LokiSamplesDiscarded (warning, 15m). Relayed via the loki-internal self-scrape keep-list plus the filter/internal_metrics allowlist in config/otel-collector-config.yaml; a name missing from either one keeps NOTHING and this panel goes silently blank.\nThis panel is EMPTY on a healthy box, not a zero line. Loki creates each loki_discarded_* series per REASON on the first discard, so 'no series' means 'nothing has ever been discarded' - the good state, and why LokiSamplesDiscarded rather than this panel is what catches the transition. Do not read an empty panel here as a broken relay: cross-check the ruler panels beside it, which are never empty on a live stack.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": -0.05,
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(loki_discarded_samples_total[5m])) by (reason)",
+          "legendFormat": "entries/s {{reason}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(loki_discarded_bytes_total[5m])) by (reason)",
+          "legendFormat": "bytes/s {{reason}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Loki discarded entries and bytes (by reason)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "The Loki ruler's own remote_write queue to Mimir (config/loki-config.yaml, ruler.remote_write). Read the three series TOGETHER - that is the whole point of relaying all three rather than just the failure counter:\n  appended  - the ruler EVALUATED a rule and wrote a sample to its WAL. Flat at zero means the ruler stopped evaluating, OR Loki is receiving no logs at all (the heartbeat rule is sum(count_over_time(...[5m])), and sum() over no lines returns an EMPTY vector, so a quiet stack legitimately appends nothing).\n  sent      - samples handed to the remote-write queue. Tracking appended = healthy.\n  failed    - NON-RECOVERABLE sends. Recoverable ones are retried, so every increment here is a recorded sample that is permanently lost.\nAlerts: LokiRulerRemoteWriteFailing (ratio, 15m) and LokiRulerNotAppending (absent-guarded, 30m). Note appended is per-tenant while sent/failed carry remote_name and url, so they are summed here rather than grouped.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisSoftMin": -0.05,
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(loki_ruler_wal_samples_appended_total[5m]))",
+          "legendFormat": "appended (ruler evaluating)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(loki_ruler_wal_prometheus_remote_storage_samples_total[5m]))",
+          "legendFormat": "sent to Mimir",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(loki_ruler_wal_prometheus_remote_storage_samples_failed_total[5m]))",
+          "legendFormat": "FAILED (permanently lost)",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Loki ruler remote-write to Mimir (samples/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "failed / sent on the Loki ruler's remote-write queue. 0 is healthy, and a HEALTHY 0 MUST STILL BE VISIBLE - hence the negative axisSoftMin, and thresholdsStyle set explicitly because this panel colours by palette-classic and a threshold step paints nothing under that colour mode. Same idiom as 'Receiver drop ratio' in the row above; see that panel for the full reasoning.\nNO clamp_min on the denominator, deliberately: if sends stop entirely while failures continue, the division yields +Inf, which is the correct reading of a total outage. A clamp would understate it as a finite number. The alert is written the same way.\nLIMIT OF THIS PANEL: it sees only what the collector relayed. If a filter edit drops the counters, this goes blank rather than red - LokiRulerNotAppending's absent() branch is what catches that case.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percentunit",
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            },
+            "axisSoftMin": -0.0015,
+            "axisSoftMax": 0.01,
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.001
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(loki_ruler_wal_prometheus_remote_storage_samples_failed_total[15m])) / sum(rate(loki_ruler_wal_prometheus_remote_storage_samples_total[15m]))",
+          "legendFormat": "failed / sent",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Loki ruler remote-write failure ratio (0 = healthy, alerts at 0.01)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "stack:loki_ruler_heartbeat:5m - the series the Loki ruler chain exists to deliver, recorded by the Loki ruler and read here out of Mimir. It counts log lines, so it proves every hop at once: rules file on disk -> ruler loads it -> evaluates -> remote_write -> Mimir -> queryable.\n  ABSENT      - the wiring is broken (ruler did not load, or remote-write is failing)\n  PRESENT > 0 - the whole chain works\n  PRESENT = 0 - the chain works and Loki is receiving nothing, which is its own incident",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "ABSENT - chain broken"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 45
+      },
+      "id": 15,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "stack:loki_ruler_heartbeat:5m",
+          "legendFormat": "lines / 5m",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Loki ruler heartbeat (lines/5m)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Mimir-Prometheus"
+      },
+      "description": "Streams on Loki's `fake` tenant. Should be ZERO. Any log landing there is headerless or misrouted telemetry - a producer or exporter that is not setting X-Scope-OrgID - and `fake` routes to the old filesystem schema period, which fails to flush (mkdir-fake permission denied). A GAUGE, so no rate() and no _total: it reads live state, 'are there fake streams RIGHT NOW'. Alert: LokiTenantFakeIngest (warning, 5m).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 45
+      },
+      "id": 16,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Mimir-Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(loki_ingester_memory_streams{tenant=\"fake\"})",
+          "legendFormat": "fake streams",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Loki `fake` tenant streams (must be 0)",
+      "type": "stat"
     }
   ],
   "refresh": "30s",
