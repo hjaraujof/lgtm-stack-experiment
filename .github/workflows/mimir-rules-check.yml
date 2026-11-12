@@ -32,7 +32,7 @@ jobs:
   check-rules:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: promtool check rules
         # A PINNED image rather than `latest`, so a Prometheus release cannot silently change what

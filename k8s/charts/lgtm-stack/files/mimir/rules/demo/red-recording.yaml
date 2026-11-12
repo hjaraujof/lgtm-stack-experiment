@@ -37,9 +37,33 @@ groups:
       # all-kind and all-span BY DESIGN - service:requests:rate5m is also the liveness signal for
       # ServiceTelemetrySilent, where "any span at all" is exactly the right question - so neither is
       # a valid term of this ratio. Full derivation and the denominator choice: slo-burn.yaml.
+      #
+      # THE `or (denominator * 0)` TERM MAKES A HEALTHY SERVICE RECORD A REAL 0. Without it the
+      # numerator selector `http_response_status_code=~"5.."` has NO SERIES until a service returns
+      # its first 5xx, and a binary operator drops the unmatched side. So the ratio was absent for
+      # every service that had never failed. clamp_min guards the DENOMINATOR against a
+      # divide-by-zero and does nothing for this.
+      #
+      # Without the term, "blank" means three different things: healthy, never yet failed, or not
+      # measurable at all. A table panel that outer-joins per-service frames also drops the 5xx
+      # column entirely when every frame is empty. A missing measurement must not read as a passing
+      # one, and a passing one must not read as missing either.
+      #
+      # A service with NO status codes at all is UNCHANGED and must stay that way: its denominator
+      # vector is empty too, so `empty * 0` is empty and `empty or empty` is empty. The ratio still
+      # produces no series, and ServiceAvailabilitySLIUnmeasurable still owns that case. The
+      # `exp_samples: []` case in tests/mimir-rules/error-sli.test.yaml guards exactly that
+      # distinction. It must keep passing.
+      #
+      # Alert impact: none. The new samples are 0, and 0 > 0.144 is false, so no burn alert can fire
+      # that did not fire before. The `and` clauses still vector-match on service_name.
       - record: service:http_5xx_ratio:5m
         expr: |
-          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[5m]))
+          (
+            sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code=~"5.."}[5m]))
+              or
+            (sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[5m])) * 0)
+          )
             / clamp_min(sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",http_response_status_code!=""}[5m])), 1e-9)
       - record: service:latency_p99_ms:5m
         expr: histogram_quantile(0.99, sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket[5m])))
@@ -61,16 +85,17 @@ groups:
       # THE GENERAL RULE: a declared dimension is not an emitted one. Verify a label carries values
       # before you aggregate by it:  count by (service_namespace) (traces_span_metrics_calls_total)
       #
-      # The only env-bearing label here is the compound service_name `<tenant>/<env>/<component>`.
-      # env is its middle segment, extracted with label_replace. A service_name that does not match
-      # the 3-segment pattern keeps env="" and lands in a visible residual bucket, rather than being
-      # silently misfiled into a real env.
+      # The only env-bearing label here is the compound service_name, either
+      # `<tenant>/<env>/<component>` or the two-segment `<env>/<component>`. env is the segment before
+      # the component, extracted with label_replace, with the tenant segment optional. A service_name
+      # that matches neither shape keeps env="" and lands in a visible residual bucket, rather than
+      # being silently misfiled into a real env.
       - record: env:requests:rate5m
         expr: |
           sum by (env) (
             label_replace(
               rate(traces_span_metrics_calls_total[5m]),
-              "env", "$1", "service_name", "[^/]+/([^/]+)/.*"
+              "env", "$1", "service_name", "(?:[^/]+/)?([^/]+)/.*"
             )
           )
       - record: env:errors:rate5m
@@ -78,7 +103,7 @@ groups:
           sum by (env) (
             label_replace(
               rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m]),
-              "env", "$1", "service_name", "[^/]+/([^/]+)/.*"
+              "env", "$1", "service_name", "(?:[^/]+/)?([^/]+)/.*"
             )
           )
       # Per-endpoint request + error rate, restricted to SERVER spans (actual request handlers,

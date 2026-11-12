@@ -12,112 +12,760 @@
       }
     ]
   },
-  "description": "Golden-path RED overview for any instrumented service. Pick a service from the variable; every panel reads the precomputed recording rules (service:*), so it is cheap to render and works for any service the moment it emits spans. New services need ZERO dashboard work - they appear in the dropdown automatically.",
+  "description": "Golden-path RED overview, sectioned by environment. The 'ENV - RED' row REPEATS over the env variable, so each environment gets its own scoreboard and its own charts instead of every service in the fleet sharing one axis. Every panel reads the precomputed recording rules (service:*, env:*, endpoint:*), so it is cheap on the CPU-bound box and a newly instrumented service - or a whole new environment - appears with ZERO dashboard work. Read the collapsed 'How to read this board' row before drawing a conclusion from a count: a sampled environment under-reports volume.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": ["stack-health"],
+      "targetBlank": false,
+      "title": "LGTM stack health",
+      "tooltip": "Is the telemetry pipeline itself healthy?",
+      "type": "dashboards"
+    },
+    {
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": ["demo-service"],
+      "targetBlank": false,
+      "title": "demo-service dashboards",
+      "tooltip": "Per-environment demo-service detail",
+      "type": "dashboards"
+    }
+  ],
   "liveNow": false,
   "panels": [
     {
-      "collapsed": false,
+      "collapsed": true,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "id": 1,
+      "panels": [
+        {
+          "datasource": { "type": "datasource", "uid": "grafana" },
+          "gridPos": { "h": 12, "w": 24, "x": 0, "y": 1 },
+          "id": 2,
+          "options": {
+            "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false },
+            "content": "## How to read this board\n\n**Sections.** One section per environment, driven by the environment variable. Sections are ordered alphabetically (dev, prod, qa), so **production is the middle section**. Narrow to a single environment with the picker at the top.\n\n**Request rate is NOT request volume where traces are sampled.** An application that head-samples traces before the collector sees them makes every count on this board low by the inverse of its sample rate, and the collector's tail sampler does the same for the environments it samples. Ratios and percentiles survive sampling; absolute counts do not. For true request volume, read the load balancer or the database's own metrics instead.\n\n**A blank 5xx ratio means exactly one thing.** A recording rule that emits no series until a service returns its FIRST 5xx makes blank mean healthy, never-yet-failed, or not measurable, with no way to tell them apart - and the column disappears entirely from a scoreboard where nothing has failed. The rule here records a real `0.00%` for a healthy service instead. Read it together with the **SLI coverage** column:\n\n| 5xx ratio | SLI coverage | Meaning |\n|---|---|---|\n| a number, incl. `0.00%` | above 0 | measured - trust it |\n| blank | blank or 0 | **not measurable** - the service emits no `http.response.status_code` on its SERVER spans (Next.js apps commonly do this). It has no server-side failure signal at all. See the `ServiceAvailabilitySLIUnmeasurable` alert. |\n\n**The other two blanks in the scoreboard mean different things again.** `p95`/`p99` blank means no traffic in the window (`Requests/s` reads 0.000). `Fast <250ms` blank means under 300 SERVER requests in 30m - the same sample gate `ServiceLatencySLIBreach` uses, below which the ratio is pure window noise.\n\n**Errors/s (span status) is a lead, not a breach.** It counts `STATUS_CODE_ERROR` across every span kind, and it can carry a permanent benign floor - for example an expected conditional-write conflict - that the spanmetrics connector emits no exception-type dimension for. It is, however, the only error signal a service with no HTTP status codes has.\n\n**The thresholds here match the alerts** in `slo-burn.yaml`: 5xx ratio 6% (slow burn, ticket) and 14.4% (fast burn, page); fast-ratio below 95% (latency breach); auth-failure ratio above 10%. Those alerts are scoped to **prod and uat only** - dev and qa carry no live error or latency paging, so a red cell in the dev or qa section pages nobody.\n\n**Exemplars.** The 5xx and latency charts carry exemplars. Click one to jump straight to the failing or slow trace in Tempo.",
+            "mode": "markdown"
+          },
+          "pluginVersion": "12.3.0",
+          "title": "How to read this board",
+          "type": "text"
+        }
+      ],
+      "title": "How to read this board - sampling, blank panels, alert thresholds",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 1 },
+      "id": 10,
       "panels": [],
-      "title": "RED — $service",
+      "title": "Fleet - all environments",
       "type": "row"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
-      "description": "Request rate (Rate). Recording rule: service:requests:rate5m.",
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "reqps" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
-      "id": 2,
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "description": "Whole-fleet request rate, one line per environment. Recording rule env:requests:rate5m, which derives env from the segment before the component in the compound service_name (the tenant segment is optional). Deliberately NOT filtered by the environment picker, so this panel stays a complete picture while the sections below narrow. A sampled environment under-reports volume - see the read-me row.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMin": 0, "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 2 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
           "editorMode": "code",
-          "expr": "service:requests:rate5m{service_name=~\"$service\"}",
-          "legendFormat": "{{service_name}}",
+          "expr": "env:requests:rate5m",
+          "legendFormat": "{{env}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Request rate",
+      "title": "Request rate by environment",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
-      "description": "Availability error ratio (Errors): fraction of inbound HTTP requests answered 5xx. Recording rule: service:http_5xx_ratio:5m. Exemplars link to a failing trace. A service that emits no http.response.status_code (Next.js apps) has NO series here rather than a 0 - see ServiceAvailabilitySLIUnmeasurable.",
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit", "max": 1, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.05 } ] } }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
-      "id": 3,
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "description": "Whole-fleet span-status error rate, one line per environment. Recording rule env:errors:rate5m. TRIAGE ONLY - it counts STATUS_CODE_ERROR on every span kind and can carry a benign floor of expected errors, so a non-zero value can be normal. Watch the SHAPE, not the level. The axis is pushed slightly below zero so a healthy flat zero is drawn rather than hidden on the axis.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMin": -0.0015, "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 2 },
+      "id": 12,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
           "editorMode": "code",
-          "exemplar": true,
-          "expr": "service:http_5xx_ratio:5m{service_name=~\"$service\"}",
-          "legendFormat": "{{service_name}}",
+          "expr": "env:errors:rate5m",
+          "legendFormat": "{{env}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "5xx ratio (5m)",
+      "title": "Span-status error rate by environment (triage lead)",
       "type": "timeseries"
     },
     {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 20,
+      "panels": [],
+      "repeat": "env",
+      "repeatDirection": "v",
+      "title": "$env - RED",
+      "type": "row"
+    },
+    {
       "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
-      "description": "Latency quantiles (Duration). Recording rules: service:latency_p50/p95/p99_ms:5m. Exemplars link to a slow trace.",
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "ms" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
-      "id": 4,
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "description": "Every service in this environment on one line each, newest sample, sorted by request rate. This is the panel to read first - a table of a dozen numbers is legible where a dozen lines on a shared axis are not.\n\nColumns: Requests/s is ALL span kinds (the liveness signal, low by the sample rate where traces are sampled). Errors/s is span status across all kinds - a lead, not a breach. 5xx ratio is the availability SLI. SLI coverage is that SLI's own denominator: inbound SERVER requests per second that actually carry an http.response.status_code, so it tells you whether the ratio beside it is measured at all.\n\nTHREE COLUMNS CAN BE BLANK AND EACH BLANK MEANS SOMETHING DIFFERENT. Read them together:\n\n- 5xx ratio blank AND SLI coverage blank: the service emits no http.response.status_code, so availability is NOT MEASURABLE - see ServiceAvailabilitySLIUnmeasurable. This is the only combination that means the board cannot see failure. A healthy service shows a real 0.00% here rather than a blank: the recording rule records a zero instead of emitting no series until a service's first 5xx, which would make this column vanish from any environment where nothing had ever failed.\n\n- p95 / p99 blank: no traffic in the window at all, and the Requests/s cell on the same row reads 0.000. Gated on requests > 0 because histogram_quantile over an empty window returns NaN, and a cell reading NaN looks like a broken panel rather than an idle service.\n\n- Fast <250ms blank: fewer than 300 SERVER requests in 30m, the SAME sample gate ServiceLatencySLIBreach uses. Below it the ratio swings 0.000..1.000 on pure window noise, so a service with a flat 5ms p99 would show a red 0% and page nobody. The column shows the latency SLI only where a latency SLI exists.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "filterable": true, "inspect": false },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Requests/s" },
+            "properties": [
+              { "id": "unit", "value": "reqps" },
+              { "id": "decimals", "value": 3 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Errors/s (span status)" },
+            "properties": [
+              { "id": "unit", "value": "reqps" },
+              { "id": "decimals", "value": 3 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "5xx ratio (SLI)" },
+            "properties": [
+              { "id": "unit", "value": "percentunit" },
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "orange", "value": 0.06 },
+                    { "color": "red", "value": 0.144 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "SLI coverage req/s" },
+            "properties": [
+              { "id": "unit", "value": "reqps" },
+              { "id": "decimals", "value": 3 },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "orange", "value": null },
+                    { "color": "green", "value": 0.0001 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "p(50|95|99)" },
+            "properties": [
+              { "id": "unit", "value": "ms" },
+              { "id": "decimals", "value": 1 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Fast <250ms (30m, n>=300)" },
+            "properties": [
+              { "id": "unit", "value": "percentunit" },
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 0.95 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 10 },
+      "id": 21,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true
+      },
+      "pluginVersion": "12.3.0",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
           "editorMode": "code",
-          "exemplar": true,
-          "expr": "service:latency_p50_ms:5m{service_name=~\"$service\"}",
-          "legendFormat": "p50 {{service_name}}",
-          "range": true,
+          "exemplar": false,
+          "expr": "service:requests:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
           "editorMode": "code",
-          "exemplar": true,
-          "expr": "service:latency_p95_ms:5m{service_name=~\"$service\"}",
-          "legendFormat": "p95 {{service_name}}",
-          "range": true,
+          "exemplar": false,
+          "expr": "service:errors:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
           "editorMode": "code",
-          "exemplar": true,
-          "expr": "service:latency_p99_ms:5m{service_name=~\"$service\"}",
-          "legendFormat": "p99 {{service_name}}",
-          "range": true,
+          "exemplar": false,
+          "expr": "service:http_5xx_ratio:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
           "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind=\"SPAN_KIND_SERVER\", http_response_status_code!=\"\", service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}[5m]))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "service:latency_p95_ms:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"} and on(service_name) (service:requests:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"} > 0)",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "service:latency_p99_ms:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"} and on(service_name) (service:requests:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"} > 0)",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
+          "refId": "F"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "service:latency_fast_ratio:30m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"} and on(service_name) (sum by (service_name) (increase(traces_span_metrics_duration_milliseconds_count{span_kind=\"SPAN_KIND_SERVER\", service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}[30m])) > 300)",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
+          "refId": "G"
         }
       ],
-      "title": "Latency p50 / p95 / p99",
+      "title": "Scoreboard - $env",
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": { "byField": "service_name", "mode": "outer" }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true,
+              "Time 7": true,
+              "__name__": true,
+              "__name__ 1": true,
+              "__name__ 2": true,
+              "__name__ 3": true,
+              "__name__ 4": true,
+              "__name__ 5": true,
+              "__name__ 6": true
+            },
+            "includeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "service_name": "Service",
+              "Value #A": "Requests/s",
+              "Value #B": "Errors/s (span status)",
+              "Value #C": "5xx ratio (SLI)",
+              "Value #D": "SLI coverage req/s",
+              "Value #E": "p95",
+              "Value #F": "p99",
+              "Value #G": "Fast <250ms (30m, n>=300)"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "desc": true, "field": "Requests/s" }] }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Rate - requests per second, ALL span kinds, for the services of this environment only. Recording rule service:requests:rate5m. This is also the liveness signal behind ServiceTelemetrySilent, so 'any span at all' is exactly the question it answers. Where traces are sampled it is NOT a volume figure.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMin": 0, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 19 },
+      "id": 22,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "expr": "service:requests:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Request rate - $env",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Errors - the availability SLI: the fraction of inbound SERVER requests answered 5xx. Recording rule service:http_5xx_ratio:5m, the same numerator ServiceErrorBudgetFastBurn pages on. Exemplars link to a failing trace.\n\nEXPECT A FLAT LINE ON ZERO for most services, and expect some services to be ABSENT. Those are different states. A healthy service that emits status codes draws a real 0 (a rule that produced no series until a service's first 5xx would leave this panel almost entirely empty, and a healthy service indistinguishable from an unmeasurable one). A service that emits no http.response.status_code at all still has no series here, deliberately: that is ServiceAvailabilitySLIUnmeasurable's case, and the scoreboard's SLI coverage column is how you tell.\n\nThe axis sits slightly below zero and soft-caps at 2% so a healthy flat zero is visible and a small real ratio is legible; the 6% and 14.4% alert lines are deliberately NOT drawn, because pinning the axis to 14.4% would flatten every real reading back into the baseline.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMax": 0.02, "axisSoftMin": -0.0015, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "off" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.06 },
+              { "color": "red", "value": 0.144 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 19 },
+      "id": 23,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Max", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "service:http_5xx_ratio:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "5xx ratio - availability SLI - $env",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Duration - p95 latency, one line per service. Recording rule service:latency_p95_ms:5m. Split away from p99 (and from p50, which now lives in the detail row) because the old single panel drew three quantiles for every service at once - three lines per service with the whole fleet selected. Exemplars link to a slow trace. Quantiles are unbiased under sampling, so the numbers here are trustworthy in a sampled environment in a way the counts are not.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMin": 0, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 29 },
+      "id": 24,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "service:latency_p95_ms:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Latency p95 - $env",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+      "description": "Duration - p99 latency, one line per service. Recording rule service:latency_p99_ms:5m. Kept on its own axis beside p95 so a single tail-heavy service cannot compress every other service's p95 into the floor. Exemplars link to a slow trace.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisSoftMin": 0, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 29 },
+      "id": 25,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "service:latency_p99_ms:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Latency p99 - $env",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "id": 30,
+      "panels": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "description": "The three quantiles together for the selected service. Useful for one service; unreadable for the fleet, which is why it lives here and not in the environment sections. Pick a service in the Service picker first.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "axisSoftMin": 0, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 40 },
+          "id": 31,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "exemplar": true,
+              "expr": "service:latency_p50_ms:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+              "legendFormat": "p50 {{service_name}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "exemplar": true,
+              "expr": "service:latency_p95_ms:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+              "legendFormat": "p95 {{service_name}}",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "exemplar": true,
+              "expr": "service:latency_p99_ms:5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+              "legendFormat": "p99 {{service_name}}",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "Latency p50 / p95 / p99 - $service",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "description": "Raw span-status error rate across ALL span kinds. Recording rule service:errors:rate5m. Nothing alerts on this and it is NOT an SLI - it can carry a permanent benign floor of expected errors (a conditional-write conflict, say), which the spanmetrics connector emits no exception-type dimension for and PromQL therefore cannot subtract. Two jobs no status-code series can do: it answers 'is anything erroring anywhere in the call tree', and it is the ONLY error signal for a service that emits no HTTP status codes. Read a step change, never a level.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "axisSoftMin": -0.0015, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 40 },
+          "id": 32,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "expr": "service:errors:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+              "legendFormat": "{{service_name}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Span-status error rate (triage lead, not an SLI) - $service",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "description": "The failure class the availability SLO deliberately excludes: the fraction of inbound requests answered 401 or 403. Recording rule service:http_auth_fail_ratio:30m. A 401 is the service working correctly, so it must not burn the error budget - but most client-credentials verifications failing 401 is a production outage that nothing else in this stack can see, because a 4xx leaves SERVER span status UNSET. The dashed line is the ServiceAuthFailureRateHigh threshold of 10%, which also requires more than 150 requests per 30m before it fires.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "axisSoftMax": 0.12, "axisSoftMin": -0.0015, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "dashed" } },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 0.1 }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 49 },
+          "id": 33,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Max", "sortDesc": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "expr": "service:http_auth_fail_ratio:30m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+              "legendFormat": "{{service_name}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Auth-failure ratio 30m (401/403) - $service",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "description": "The latency SLI itself: the fraction of INBOUND SERVER requests served under 250ms over 30m. Recording rule service:latency_fast_ratio:30m. The dashed line is the ServiceLatencySLIBreach threshold of 95%. That alert also gates on more than 300 SERVER requests per 30m, so a sparse service can sit far below the line here and correctly page nobody - read the scoreboard's SLI coverage column before treating a dip as real.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "axisSoftMax": 1, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false, "thresholdsStyle": { "mode": "dashed" } },
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 0.95 }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 49 },
+          "id": 34,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Min", "sortDesc": false },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "expr": "service:latency_fast_ratio:30m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"}",
+              "legendFormat": "{{service_name}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Latency SLI - fraction under 250ms over 30m - $service",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "description": "Busiest inbound endpoints. Recording rule endpoint:requests:rate5m, restricted to SERVER spans, so this is real request handlers and not internal spans. Note that a service's inbound rate here can be far lower than its all-span Requests/s above - a service with a deep call tree emits hundreds of spans per inbound request.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "axisSoftMin": 0, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 58 },
+          "id": 35,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Last *", "sortDesc": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "expr": "topk(10, endpoint:requests:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"})",
+              "legendFormat": "{{service_name}} {{span_name}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Top 10 endpoints by request rate - $service",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+          "description": "Failing inbound endpoints. Recording rule endpoint:errors:rate5m - SERVER spans with STATUS_CODE_ERROR. This is the drill-down that turns 'the service is erroring' into 'this route is erroring'. It is span status, so it inherits the same caveats as the triage panel and it cannot see a 4xx.",
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "axisSoftMin": -0.0015, "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 58 },
+          "id": 36,
+          "options": {
+            "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true, "sortBy": "Max", "sortDesc": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+              "editorMode": "code",
+              "expr": "topk(10, endpoint:errors:rate5m{service_name=~\"(?:($tenant)/)?($env)/[^/]+\", service_name=~\"$service\"})",
+              "legendFormat": "{{service_name}} {{span_name}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Top 10 endpoints by span-status error rate - $service",
+          "type": "timeseries"
+        }
+      ],
+      "title": "Detail - one service ($service)",
+      "type": "row"
     }
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["red", "golden-path", "template"],
+  "tags": ["red", "golden-path", "template", "services"],
   "templating": {
     "list": [
       {
-        "current": {},
+        "allValue": "[^/]+",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+        "definition": "label_values(env:requests:rate5m, env)",
+        "description": "Repeats the RED section once per selected environment. Read from the env:* recording rules, so a new environment appears here on its own with no dashboard edit. Grafana orders the repeated rows by this variable's sort, so they run dev, prod, qa - production is the MIDDLE section.",
+        "includeAll": true,
+        "label": "Environment",
+        "multi": true,
+        "name": "env",
+        "options": [],
+        "query": { "query": "label_values(env:requests:rate5m, env)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": "[^/]+",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
         "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
         "definition": "label_values(service:requests:rate5m, service_name)",
+        "description": "First segment of the compound service_name - tenant-a, tenant-b, tenant-c. Extracted from service_name with a named capture group rather than hardcoded, so a new tenant needs no dashboard edit. allValue is '.*', so the default All view is correct even if the capture returns nothing.",
         "includeAll": true,
+        "label": "Tenant",
+        "multi": true,
+        "name": "tenant",
+        "options": [],
+        "query": { "query": "label_values(service:requests:rate5m, service_name)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "regex": "/^(?<value>[^\\/]+)\\/[^\\/]+\\/[^\\/]+$/",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "Mimir-Prometheus" },
+        "definition": "label_values(service:requests:rate5m, service_name)",
+        "description": "Narrows every panel, and drives the collapsed detail row at the bottom. Leave it on All for the fleet survey; pick one service before you open the detail row. It is NOT chained to the environment picker - the panels intersect both selectors in PromQL instead, so the dropdown always lists the whole fleet.",
+        "includeAll": true,
+        "label": "Service",
         "multi": true,
         "name": "service",
         "options": [],

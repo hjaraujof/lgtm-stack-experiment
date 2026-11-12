@@ -60,7 +60,7 @@ Application --> OTel Collector (OTLP) --> {Loki, Tempo, Mimir} --> Grafana
 Span metrics and traces are sampled at different points, so the two planes disagree by design.
 
 - **Head sampling** happens in the application's OTel SDK (for example `ParentBased(root=TraceIdRatioBased(r))`), before the collector sees anything. It affects every plane, and no collector policy can recover a dropped trace. The `keep-errors` tail policy sees only what the SDK exported.
-- **Tail sampling** affects Tempo only. In `config/otel-collector-config.yaml`, `traces/in` exports to the `spanmetrics` and `servicegraph` connectors and to `forward`, and only `traces/store` (fed by `forward`) runs `tail_sampling`. The shipped example keeps `service.name` matching `.*/(dev|prod)/.*`, every error, every trace over 200 ms, and 10% of the rest.
+- **Tail sampling** affects Tempo only. In `config/otel-collector-config.yaml`, `traces/in` exports to the `spanmetrics` and `servicegraph` connectors and to `forward`, and only `traces/store` (fed by `forward`) runs `tail_sampling`. The shipped example keeps `service.name` matching `(.*/)?(dev|prod)/.*` (tenant segment optional), every error, every trace over 200 ms, and 10% of the rest.
 
 So the keep rate is per plane, not per environment. Span metrics carry the head rate `r`; Tempo carries `r` times the tail policy. Check both for the service and environment before you scale a count. Scaling an unsampled plane by a keep rate overstates it by 1/r.
 

@@ -2,6 +2,47 @@
 
 ---
 
+## Third mirror pass: Loki ruler, healthy zeros, two-segment names, redaction
+
+A third port from the same internal source. It covers the internal work after the second pass, under
+the same sanitization contract and its three extra rules. Each file was hand-ported from the internal
+end state. No internal commit was cherry-picked, so no internal author or ticket key reached this
+history.
+
+### What was ported
+
+| Area | Detail |
+|---|---|
+| Loki ruler | `config/loki-config.yaml` gets a `ruler` block: rules from a read-only bind mount of `config/loki/rules/`, a WAL on the Loki volume, and `remote_write` to Mimir. `ruler-heartbeat.yaml` records `stack:loki_ruler_heartbeat:5m`. The Helm chart mounts the same rules through a new ConfigMap |
+| Loki ruler alerts | `LokiRulerRemoteWriteFailing` and `LokiRulerNotAppending` in `stack-alerts.yaml` (alerts 31 → **33**), a runbook, and a promtool suite. The collector relays the three `loki_ruler_wal_*` counters through both of its filters |
+| Healthy zero | every 5xx and auth-failure ratio carries `or (denominator * 0)`, so a service that has never failed records a real 0 instead of no series. A service with no status codes still records nothing, and `error-sli.test.yaml` now asserts both cases on all five recordings |
+| Two-segment service name | every env selector accepts `<env>/<component>` as well as `<tenant>/<env>/<component>`: the Mimir rules, the `env:*` recordings, the tail-sampling policy and the demo-service TraceQL panels. Guarded by `two-segment-service-name.test.yaml` and `tests/scripts/test-service-name-shapes.py` |
+| Collector | redaction of secret query parameters from span attributes and log bodies (`transform/normalize`, new `transform/redact_logs`) with `tests/collector/test-redaction.py`; `target_info` written by one pipeline only; the collector's own process and `sent_*` metrics and the Tempo distributor ingest counters relayed |
+| Dashboards | Service RED split by environment, with a scoreboard that gates its noisy columns; a new `services/error-traces.json`; a Loki row on LGTM Stack Health; `allowUiUpdates: false` on all three providers, so git is the only way a dashboard changes |
+| Alertmanager deploy | `docker-compose.yml` now states that a `git pull` does not deploy `demo-am.yaml`: the single-file bind mount pins the inode, so `mimir-am-init` must be recreated |
+| CI | `loki-rules-check.yml` boots the real Loki against the rule files, with two negative controls (invalid LogQL, flat layout). `config-check.yml` gains the redaction and service-name gates. Action majors moved off the Node-20 runtime |
+
+Verified locally, not asserted:
+
+- All 49 rules pass `promtool check rules`. All 7 promtool suites pass `promtool test rules`.
+- `two-segment-service-name.test.yaml` and the new `error-sli.test.yaml` cases FAIL against the
+  previous rules, so they detect a revert.
+- `test-service-name-shapes.py` passes on the new collector config and fails on the old one.
+- The redaction test, the reconciler test, `docker compose config -q`, `bash -n` and
+  `shellcheck -S warning` pass. So do the collector, Loki and amtool validators.
+- `make -C k8s check-sync` passes. `helm lint` and `helm template` pass for both overlays. The
+  Loki and collector configs extracted from the rendered chart pass their own validators.
+
+### Deliberately NOT ported
+
+| Dropped | Reason |
+|---|---|
+| Loki recording rules for one internal library's retry log lines, and their alerts | They match exact log literals of a private library. The Loki ruler plumbing they needed is ported; the heartbeat rule is the generic example |
+| An alert on a dual-write divergence record of one internal service, with its Loki rule, test and runbook | A single-service application alert. No generic value |
+| An alert on swallowed config-fetch failures, with its test, runbook and Alertmanager inhibition entry | It watches a span name that one private instrumentation package emits, and its threshold was calibrated on a private incident |
+| Internal `CLAUDE.md` corrections | They describe the live internal system: sample rates, instance facts. This repo's `CLAUDE.md` gets only the tail-sampling regex change |
+| Internal planning docs, and the trace-error report change | Private planning. The report script was never ported |
+
 ## Second mirror pass — alerting, SLOs, runbooks, tests and CI
 
 A second port from the same internal source, covering the work done there after the first mirror.

@@ -1,0 +1,120 @@
+# promtool unit tests for the two-segment service name.
+#
+# Some instrumentation names a service "{env}/{component}" instead of "{tenant}/{env}/{component}".
+# If every env selector requires the tenant segment, such a service drops out of the env:*
+# recordings and every PROD/UAT alert, and nothing reports an error. These cases pin that both
+# shapes are evaluated alike, and that dev stays out of live paging in either shape.
+#
+# Run:
+#   docker run --rm --entrypoint promtool -v "$PWD:/w:ro" prom/prometheus:v3.1.0 \
+#     test rules /w/tests/mimir-rules/two-segment-service-name.test.yaml
+
+# ORDER MATTERS: red-recording.yaml records what slo-burn.yaml consumes in the same tick.
+rule_files:
+    - ../../config/mimir/rules/demo/red-recording.yaml
+    - ../../config/mimir/rules/demo/slo-burn.yaml
+    - ../../config/mimir/rules/demo/stack-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+    # A two-segment prod service with a real 5xx regression pages exactly as a three-segment one does
+    # (15% of inbound requests 5xx: over both the 14.4% fast-burn line and the 5% ratio line).
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="prod/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+17x200'
+          - series: 'traces_span_metrics_calls_total{service_name="prod/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="500"}'
+            values: '0+3x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts:
+                - exp_labels:
+                      severity: critical
+                      service_name: prod/orders-api
+                  exp_annotations:
+                      summary: 'PROD/UAT prod/orders-api burning error budget fast (>14.4% of inbound requests 5xx, 1h+5m) - 99% SLO at risk within ~2d'
+                      runbook_url: 'docs/runbooks/service-error-budget.md'
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts:
+                - exp_labels:
+                      severity: warning
+                      service_name: prod/orders-api
+                  exp_annotations:
+                      summary: 'PROD/UAT prod/orders-api >5% of inbound requests answered 5xx over 5m'
+                      runbook_url: 'docs/runbooks/service-error-budget.md'
+
+    # The same regression on a two-segment dev service does not page: dev keeps only absence and
+    # crash alerting, in either name shape.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="dev/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+17x200'
+          - series: 'traces_span_metrics_calls_total{service_name="dev/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="500"}'
+            values: '0+3x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts: []
+
+    # uat is production-critical: a two-segment uat service pages like prod.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="uat/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+17x200'
+          - series: 'traces_span_metrics_calls_total{service_name="uat/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="500"}'
+            values: '0+3x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts:
+                - exp_labels:
+                      severity: critical
+                      service_name: uat/orders-api
+                  exp_annotations:
+                      summary: 'PROD/UAT uat/orders-api burning error budget fast (>14.4% of inbound requests 5xx, 1h+5m) - 99% SLO at risk within ~2d'
+                      runbook_url: 'docs/runbooks/service-error-budget.md'
+
+    # qa is expected-noisy and never pages, in either shape; a 4-segment name never pages either,
+    # because every selector stays fully anchored with a single trailing segment.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="qa/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+17x200'
+          - series: 'traces_span_metrics_calls_total{service_name="qa/orders-api",span_kind="SPAN_KIND_SERVER",http_response_status_code="500"}'
+            values: '0+3x200'
+          - series: 'traces_span_metrics_calls_total{service_name="a/b/prod/x",span_kind="SPAN_KIND_SERVER",http_response_status_code="200"}'
+            values: '0+17x200'
+          - series: 'traces_span_metrics_calls_total{service_name="a/b/prod/x",span_kind="SPAN_KIND_SERVER",http_response_status_code="500"}'
+            values: '0+3x200'
+      alert_rule_test:
+          - eval_time: 90m
+            alertname: ServiceErrorBudgetFastBurn
+            exp_alerts: []
+          - eval_time: 90m
+            alertname: HighServiceErrorRatio
+            exp_alerts: []
+
+    # env:requests:rate5m derives env from both shapes, so the dashboards' $env picker and the
+    # fleet panel see a moved service. 60 calls/min = 1/s per series.
+    - interval: 1m
+      input_series:
+          - series: 'traces_span_metrics_calls_total{service_name="dev/orders-api",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+60x30'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-a/dev/auth-api",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+60x30'
+          - series: 'traces_span_metrics_calls_total{service_name="tenant-b/prod/inventory-api",span_kind="SPAN_KIND_SERVER"}'
+            values: '0+60x30'
+      promql_expr_test:
+          - expr: env:requests:rate5m
+            eval_time: 20m
+            exp_samples:
+                - labels: 'env:requests:rate5m{env="dev"}'
+                  value: 2
+                - labels: 'env:requests:rate5m{env="prod"}'
+                  value: 1

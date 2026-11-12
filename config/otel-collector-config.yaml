@@ -137,8 +137,27 @@ receivers:
             # filter/internal_metrics allowlist. Loki serves standard Prometheus exposition, so the
             # suffix is present at scrape and survives into Mimir. Get either end wrong and this
             # keeps NOTHING, silently. See the per-source note on filter/internal_metrics.
+            #
+            # THE LOKI RULER'S REMOTE-WRITE COUNTERS. The ruler records series from logs and
+            # remote-writes them to Mimir, but whether that write SUCCEEDS is visible only in its own
+            # /metrics. Three names, not one, because an absent recorded series in Mimir has two
+            # causes that need different responses:
+            #   ..._remote_storage_samples_failed_total - the numerator: sends that failed
+            #   ..._remote_storage_samples_total        - the denominator, so the alert is a RATIO
+            #                                             and one transient failure does not page
+            #   loki_ruler_wal_samples_appended_total   - the ruler EVALUATED and appended at all.
+            #                                             Without it, "remote-write is failing" and
+            #                                             "the ruler stopped evaluating" look
+            #                                             identical downstream (both = no series).
+            # The two remote_storage counters carry remote_name, tenant and url labels: one series
+            # each per tenant.
+            #
+            # NEAR-MISS: filter/internal_metrics below also allows
+            # prometheus_remote_storage_samples_failed_total. That is MIMIR's own counter, a
+            # DIFFERENT string. The Loki ruler's carries the loki_ruler_wal_ prefix, and a reader
+            # skimming for "remote_storage_samples_failed" will wrongly conclude it is covered.
             - source_labels: [__name__]
-              regex: 'loki_ingester_memory_streams|loki_discarded_samples_total|loki_discarded_bytes_total'
+              regex: 'loki_ingester_memory_streams|loki_discarded_samples_total|loki_discarded_bytes_total|loki_ruler_wal_prometheus_remote_storage_samples_failed_total|loki_ruler_wal_prometheus_remote_storage_samples_total|loki_ruler_wal_samples_appended_total'
               action: keep
           static_configs:
             - targets: ['loki:3100']
@@ -218,6 +237,18 @@ connectors:
     # than the longest reset-sensitive window any rule, report or dashboard reads. 48h gives a full
     # 24h of margin over a 24h report window.
     # IF A RULE OR REPORT EVER READS A WINDOW LONGER THAN 24h, RAISE THIS IN LOCKSTEP.
+    #
+    # WHAT 48h ACTUALLY EVICTS, which is less than the name suggests: eviction is RESOURCE-level, not
+    # per metric key. The resource here is keyed on service.name (above), so a LIVE service keeps
+    # every span.name it has ever emitted, re-written on every flush, for as long as it stays alive.
+    # Only a service that falls fully silent for 48h is evicted, and then it is evicted whole.
+    #
+    # TWO CONSEQUENCES. A span name that a service stops emitting does NOT age out: its series stay
+    # frozen at their last value until the collector RESTARTS, which is the only thing that clears
+    # them. And LOWERING this value buys nothing against key growth inside a live service, which is
+    # the actual growth problem, while it does make idle-service eviction more aggressive, which costs
+    # target_info coverage (see the mimir_no_target_info exporter below). All of the cost, none of
+    # the benefit.
     metrics_expiration: 48h
 
   # Service dependency graph metrics on 100% of traffic.
@@ -265,6 +296,37 @@ processors:
   #                                             from dispatching nothing; both need watching.
   #   cortex_alertmanager_config_hash           out-of-band config-write detector
   #   loki_discarded_samples / _bytes           the per-entry discard tripwire Loki otherwise lacks
+  #   loki_ruler_wal_*                          the Loki ruler's remote-write to Mimir: failed,
+  #                                             total, and appended. BOTH ends need these names: the
+  #                                             loki-internal job above has a keep-only relabel, so a
+  #                                             name added here and not there (or the reverse) keeps
+  #                                             NOTHING, with no error anywhere
+  #   otelcol_process_cpu_seconds / _memory_rss collector CPU and RSS, the missing half of any cost
+  #                                             claim about the collector
+  #   otelcol_process_uptime                    RESTART DETECTION. resets() on the receiver counters
+  #                                             returns 0, because each start mints a new
+  #                                             service_instance_id rather than resetting a counter,
+  #                                             so a restart is otherwise invisible. Uptime falls at a
+  #                                             restart, which is directly alertable
+  #   otelcol_exporter_sent_*                   per-backend export volume: the denominator the
+  #                                             send_failed_* counters lack on their own
+  #   tempo_distributor_{spans,bytes}_received  Tempo ingest volume; bytes is the better cost proxy
+  #
+  # HOW TO GET AN otelcol_* NAME RIGHT. Determine it EMPIRICALLY, never infer it, because a wrong
+  # name keeps nothing and says nothing. Run the pinned collector image with a prometheus receiver
+  # scraping its own :8888 into a detailed debug exporter, and read the OTLP names the receiver
+  # actually emits. Those, not the names on the wire, are what `name !=` is matched against.
+  #   - DO NOT run that probe with an explicit service.telemetry.metrics.readers block. A
+  #     pull/prometheus reader makes :8888 serve Prometheus-style names, and the receiver then emits
+  #     otelcol_process_cpu_seconds_total and similar - forms that match NOTHING here. This file
+  #     does not set that block, so :8888 is OTel-native and the suffix-free forms are correct.
+  #   - UNIT SUFFIXES ARE STRIPPED INCONSISTENTLY. otelcol_process_memory_rss_bytes arrives as
+  #     otelcol_process_memory_rss and otelcol_process_uptime_seconds_total as
+  #     otelcol_process_uptime, while otelcol_process_runtime_total_sys_memory_bytes KEEPS its
+  #     _bytes. Read each name off the probe; do not derive one from another.
+  # tempo_* is the opposite convention: Tempo serves Prometheus exposition, so those keep _total.
+  # Neither the otelcol-internal nor the tempo-internal job has a keep-only relabel, so unlike
+  # loki_ruler_wal_* those names change at THIS end only.
   #
   # ============================ SUFFIXES ARE PER-SOURCE. READ THIS. ============================
   #   cortex_* / tempo_* / loki_*  scraped from standard Prometheus exposition. They ARRIVE and are
@@ -281,7 +343,7 @@ processors:
     error_mode: ignore
     metrics:
       metric:
-        - 'name != "tempo_discarded_spans_total" and name != "tempodb_compaction_outstanding_blocks" and name != "tempo_live_store_live_traces" and name != "tempo_live_store_complete_queue_length" and name != "tempo_live_store_back_pressure_seconds_total" and name != "prometheus_remote_storage_samples_failed_total" and name != "cortex_discarded_samples_total" and name != "cortex_ingester_memory_series" and name != "cortex_ingester_shipper_upload_failures_total" and name != "cortex_compactor_runs_failed_total" and name != "otelcol_processor_tail_sampling_sampling_trace_dropped_too_early" and name != "otelcol_processor_tail_sampling_count_traces_sampled" and name != "otelcol_processor_tail_sampling_sampling_traces_on_memory" and name != "otelcol_exporter_send_failed_spans" and name != "otelcol_exporter_send_failed_metric_points" and name != "otelcol_exporter_send_failed_log_records" and name != "otelcol_exporter_queue_size" and name != "otelcol_exporter_queue_capacity" and name != "otelcol_receiver_refused_spans" and name != "otelcol_receiver_accepted_spans" and name != "otelcol_receiver_accepted_metric_points" and name != "otelcol_receiver_refused_metric_points" and name != "otelcol_receiver_accepted_log_records" and name != "otelcol_receiver_refused_log_records" and name != "loki_ingester_memory_streams" and name != "loki_discarded_samples_total" and name != "loki_discarded_bytes_total" and name != "cortex_prometheus_notifications_sent_total" and name != "cortex_alertmanager_notifications_total" and name != "cortex_alertmanager_notification_errors_total" and name != "cortex_alertmanager_config_hash"'
+        - 'name != "tempo_discarded_spans_total" and name != "tempodb_compaction_outstanding_blocks" and name != "tempo_live_store_live_traces" and name != "tempo_live_store_complete_queue_length" and name != "tempo_live_store_back_pressure_seconds_total" and name != "prometheus_remote_storage_samples_failed_total" and name != "cortex_discarded_samples_total" and name != "cortex_ingester_memory_series" and name != "cortex_ingester_shipper_upload_failures_total" and name != "cortex_compactor_runs_failed_total" and name != "otelcol_processor_tail_sampling_sampling_trace_dropped_too_early" and name != "otelcol_processor_tail_sampling_count_traces_sampled" and name != "otelcol_processor_tail_sampling_sampling_traces_on_memory" and name != "otelcol_exporter_send_failed_spans" and name != "otelcol_exporter_send_failed_metric_points" and name != "otelcol_exporter_send_failed_log_records" and name != "otelcol_exporter_queue_size" and name != "otelcol_exporter_queue_capacity" and name != "otelcol_receiver_refused_spans" and name != "otelcol_receiver_accepted_spans" and name != "otelcol_receiver_accepted_metric_points" and name != "otelcol_receiver_refused_metric_points" and name != "otelcol_receiver_accepted_log_records" and name != "otelcol_receiver_refused_log_records" and name != "loki_ingester_memory_streams" and name != "loki_discarded_samples_total" and name != "loki_discarded_bytes_total" and name != "cortex_prometheus_notifications_sent_total" and name != "cortex_alertmanager_notifications_total" and name != "cortex_alertmanager_notification_errors_total" and name != "cortex_alertmanager_config_hash" and name != "loki_ruler_wal_prometheus_remote_storage_samples_failed_total" and name != "loki_ruler_wal_prometheus_remote_storage_samples_total" and name != "loki_ruler_wal_samples_appended_total" and name != "otelcol_process_cpu_seconds" and name != "otelcol_process_memory_rss" and name != "otelcol_process_uptime" and name != "otelcol_exporter_sent_spans" and name != "otelcol_exporter_sent_metric_points" and name != "otelcol_exporter_sent_log_records" and name != "tempo_distributor_spans_received_total" and name != "tempo_distributor_bytes_received_total"'
 
   # OPTIONAL SOURCE CUT — an EXAMPLE, disabled by default because the span names below are specific
   # to one codebase. Fill in your own names and add it back to the traces/in pipeline to use it.
@@ -301,6 +363,13 @@ processors:
   # HONEST CAVEAT ON THE CPU CLAIM: a filter is not free. The OTTL condition is evaluated against the
   # FULL stream, which offsets some of the saving. Measure before and after rather than assume.
   # Cutting the volume at the SOURCE — not emitting the spans at all — is the only unambiguous lever.
+  #
+  # RETIRE IT WHEN THE SOURCE CUT LANDS. Once the producer stops emitting those spans, the filter
+  # matches nothing and only costs its evaluation. Verify against the running system, not the source:
+  #   sum by (span_name) (increase(traces_span_metrics_calls_total{span_name=~"YourLeafBookkeepingClass.*"}[24h]))
+  # should return NO series, while the same query without the selector returns many (the control
+  # that proves the query works). A wrapper span you could not drop here is cut AT SOURCE instead:
+  # its children then re-parent to the calling span, which is the form of that cut that works.
   #
   # filter/drop_bookkeeping:
   #   error_mode: ignore
@@ -371,9 +440,54 @@ processors:
           # `/api/v2` are untouched, while `/12345` becomes `/{id}`.
           - replace_pattern(name, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "{id}")
           - replace_pattern(name, "/[0-9]{4,}", "/{id}")
+          # SECRETS IN URLS. Some auth URLs carry a credential in the query string, and the full URL
+          # is stored on the span: Next.js puts it on its server span in http.target and on its fetch
+          # CLIENT span in http.url and next.span_name; the undici CLIENT span puts it in url.full and
+          # url.query. The worst case is a logout URL that carries the user's live access token as
+          # token=. Lower-risk members of the same class are the OAuth code/state on a login callback
+          # and a signed short-lived continue= redirect.
+          #
+          # Fix the clients too, but code and state stay in the callback URL by protocol, and this is
+          # the one chokepoint that covers every service, audited or not. So the value is removed
+          # here, at ingest, as well as at the sources.
+          #
+          # Only the VALUE is replaced; the parameter NAME stays, so a span still shows that a token
+          # was sent. clientId, returnUrl, code_challenge, xtoken, every other parameter and the
+          # #fragment survive. `(^|[?&])` and not `[?&]`, because url.query has no leading `?`.
+          # This must stay in traces/in, BEFORE the connectors and forward, so that tail_sampling
+          # and Tempo only ever receive the redacted copy.
+          #
+          # tests/collector/test-redaction.py runs these statements in the pinned image. It reads
+          # them out of this file, so a change here is tested as written.
+          - replace_pattern(attributes["http.target"], "(^|[?&])(code|state|token|continue|access_token|id_token|refresh_token)=[^&#]*", "$${1}$${2}=REDACTED")
+          - replace_pattern(attributes["http.url"], "(^|[?&])(code|state|token|continue|access_token|id_token|refresh_token)=[^&#]*", "$${1}$${2}=REDACTED")
+          - replace_pattern(attributes["url.full"], "(^|[?&])(code|state|token|continue|access_token|id_token|refresh_token)=[^&#]*", "$${1}$${2}=REDACTED")
+          - replace_pattern(attributes["url.query"], "(^|[?&])(code|state|token|continue|access_token|id_token|refresh_token)=[^&#]*", "$${1}$${2}=REDACTED")
+          - replace_pattern(attributes["next.span_name"], "(^|[?&])(code|state|token|continue|access_token|id_token|refresh_token)=[^&#]*", "$${1}$${2}=REDACTED")
       - context: resource
         statements:
           - delete_key(attributes, "service.namespace")
+
+  # The same secret-in-URL redaction as transform/normalize, for the logs pipeline. An app that
+  # logs a redirect URL (a logout redirect, say) ships the token inside the log line, through OTLP,
+  # to Loki.
+  #
+  # BOTH TARGETS MUST BE STRINGS, which replace_pattern needs - on a map it is a silent no-op. This
+  # example assumes a logging transport that sets body to the message string and serialises every
+  # non-promoted field into ONE string attribute named `context`, as JSON. Adjust the attribute
+  # name to what YOUR transport emits. If the transport ever emits a structured body or context,
+  # this stops matching and says nothing, so re-check it after a logging-library upgrade.
+  #
+  # The value class adds `"` and `\` to the traces version's `[^&#]`: inside a JSON string the URL
+  # ends at a quote, or at `\"` when the URL itself sits inside a quoted string. Without them the
+  # match runs on through the closing quote and eats the next field.
+  transform/redact_logs:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - replace_pattern(attributes["context"], "(^|[?&])(code|state|token|continue|access_token|id_token|refresh_token)=[^&#\"\\\\]*", "$${1}$${2}=REDACTED")
+          - replace_pattern(body, "(^|[?&])(code|state|token|continue|access_token|id_token|refresh_token)=[^&#\"\\\\]*", "$${1}$${2}=REDACTED")
 
   # Application OTLP metrics, for the `metrics` pipeline.
   #
@@ -432,7 +546,10 @@ processors:
         string_attribute:
           key: service.name
           values:
-            - ".*/(dev|prod)/.*"     # EXAMPLE: adjust to your own low-volume envs
+            # The tenant segment is optional, so a two-segment "<env>/<component>" name matches as
+            # well as "<tenant>/<env>/<component>". ".*/(dev|prod)/.*" requires a slash BEFORE the env
+            # and silently samples every two-segment dev and prod trace at the remainder rate.
+            - "(.*/)?(dev|prod)/.*"  # EXAMPLE: adjust to your own low-volume envs
           enabled_regex_matching: true
           cache_max_size: 200
       - name: keep-errors
@@ -502,6 +619,66 @@ exporters:
       max_interval: 30s
       max_elapsed_time: 300s
 
+  # The SAME endpoint with target_info suppressed, used ONLY by the app `metrics` pipeline.
+  #
+  # THE DEFECT THIS FIXES. The PRW exporter emits one target_info series per RESOURCE, and two
+  # pipelines export the same application resource to it:
+  #   metrics      - the app's own OTLP metric exports, on the SDK's fixed cadence.
+  #   metrics/gen  - the spanmetrics + servicegraph connectors, whose output resource is COPIED
+  #                  from the spans (resource_metrics_key_attributes keys the grouping, it does not
+  #                  strip the copy), so it carries the same service.name AND service.instance.id
+  #                  and hashes to the SAME target_info identity. It flushes on its own cadence.
+  # One series, two writers, two independent timestamps. Whichever push lands second with the older
+  # timestamp is rejected as err-mimir-sample-out-of-order, the collector logs `Permanent error ...
+  # Dropping data`, and only the generic CollectorExportFailing symptom fires.
+  #
+  # PUT THE SUPPRESSION ON THE PIPELINE THAT IS NOT ANY SERVICE'S ONLY WRITER. Suppressing it on
+  # metrics/gen instead looks equivalent and is WRONG: a service that emits spans but exports no
+  # OTLP metrics of its own has the connector as its ONLY target_info writer, so that variant
+  # deletes its target_info outright. In an environment where every service also exports metrics,
+  # that mistake is invisible. Every service on `metrics` has the connector as a second writer, so
+  # suppressing it here removes no job's only writer.
+  #
+  # TWO TRADE-OFFS.
+  # 1. The surviving writer is the connector's COPY of the resource, pinned to whichever
+  #    service.instance.id was seen first for that service.name. For a multi-instance service the
+  #    `instance` label on target_info can lag.
+  # 2. COVERAGE IS TRAFFIC-DEPENDENT. The connector re-flushes a cached resource whether or not new
+  #    spans arrive, so an idle service keeps its target_info until the 48h resource eviction on the
+  #    spanmetrics connector fires, and then loses it until traffic returns. Under the app-metrics
+  #    writer it was emitted regardless of traffic.
+  #
+  # WHEN CHECKING WHICH SERVICES "HAVE SPANS", USE THE RATE, NOT SERIES EXISTENCE. A span-metric
+  # series outlives the traffic that created it (see metrics_expiration above), so existence proves
+  # a service ONCE emitted spans, not that it emits them now. Ask rate(...[10m]) > 0.
+  #
+  # NOT FIXED BY: raising Mimir's out_of_order_time_window, which keeps both writers and pays for
+  # the duplicate in churn (and is not needed once there is one writer); nor by stripping the
+  # resource in metrics/gen, which would move the `job` and `instance` labels on every
+  # traces_span_metrics_* series - a live-series rename. Do not "simplify" this by re-enabling
+  # target_info on both pipelines: the collision and the rejections come straight back.
+  #
+  # ONE GAP NO ARRANGEMENT HERE CAN CLOSE: a service emitting LOGS but no spans has no target_info
+  # and no span-metric series to notice it by. If its traces file under a different service.name,
+  # that is a resource-attribute defect in the service, not something this config can fix.
+  #
+  # metrics/host and metrics/internal stay on the exporter above: their resources carry distinct
+  # job/instance identities (the host, and the scrape targets), so they have no collision.
+  #
+  # `target_info.enabled` is a real key in 0.142: `validate` accepts it and REJECTS a bogus sibling
+  # key, so the accepted one is not being silently ignored.
+  prometheusremotewrite/mimir_no_target_info:
+    endpoint: http://mimir:9009/api/v1/push
+    headers:
+      X-Scope-OrgID: "demo"
+    target_info:
+      enabled: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
 service:
   extensions: [health_check, file_storage/queue, pprof, zpages]
   pipelines:
@@ -527,13 +704,17 @@ service:
     metrics/gen:
       receivers: [spanmetrics, servicegraph]
       processors: [memory_limiter, batch]
+      # KEEPS target_info. This is every span-emitting service's writer, and for a service that
+      # exports no OTLP metrics it is the ONLY one. See the mimir_no_target_info exporter comment.
       exporters: [prometheusremotewrite/mimir]
     # Application metrics from the OTel SDKs. transform/app_metrics gives them the service_name label
     # the rest of this stack keys on, and un-doubles job. See the processor comment.
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, transform/app_metrics, batch]
-      exporters: [prometheusremotewrite/mimir]
+      # target_info suppressed HERE, not on metrics/gen: both pipelines carried the same application
+      # resource, so both wrote one target_info series and Mimir rejected the older-stamped write.
+      exporters: [prometheusremotewrite/mimir_no_target_info]
     # Internal /metrics scrapes, filtered to incident-relevant series -> Mimir. THIS PIPELINE IS WHAT
     # MAKES THE STACK'S OWN FAILURES ALERTABLE: Tempo discards and compaction stalls, Mimir sample
     # discards and block-upload failures, collector tail-sampling drops and export failures, Loki
@@ -542,9 +723,10 @@ service:
       receivers: [prometheus/internal]
       processors: [filter/internal_metrics, memory_limiter, batch]
       exporters: [prometheusremotewrite/mimir]
+    # transform/redact_logs strips secret query-parameter values before Loki stores them.
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, transform/redact_logs, batch]
       exporters: [otlphttp/loki]
   telemetry:
     logs:

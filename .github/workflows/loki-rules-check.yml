@@ -1,0 +1,256 @@
+# Validate the Loki ruler's rule files.
+#
+# WHY THIS IS A SEPARATE WORKFLOW AND NOT A STEP IN mimir-rules-check.yml. The two rule sets need
+# DIFFERENT validators, because they are different query languages. mimir-rules-check.yml uses
+# `promtool check rules`, the parser Prometheus and Mimir use. promtool cannot parse LogQL, so
+# pointing it at these files would either error on every one or pass them on a technicality and
+# read as coverage that does not exist.
+#
+# WHY IT HAS TO BOOT LOKI. There is no LogQL rule linter:
+#   - the grafana/loki:3.7.3 image is distroless and holds only /usr/bin/loki (no shell, no
+#     lokitool, no logcli)
+#   - `loki -verify-config` validates the CONFIG FILE and never reads the rules directory
+# So the only parser that can tell a valid LogQL rule from an invalid one is Loki itself. This
+# workflow starts the real binary with the rules mounted exactly as docker-compose mounts them,
+# and asserts against the ruler's own API.
+#
+# WHY THE API AND NOT THE STARTUP LOG. Run the same rule file under two directory layouts:
+#   config/loki/rules/demo/x.yaml -> /loki/api/v1/rules lists the group
+#   config/loki/rules/x.yaml      -> "unable to read rule dir /etc/loki/rules/demo: no such file
+#                                     or directory" from the API, while the startup log still says
+#                                     level=info msg="ruler up and running" with NO error
+# A misplaced or unreadable rules directory does NOT stop Loki booting and does NOT appear in its
+# log. It loads nothing and looks healthy. Only the API knows.
+#
+# AN UNPARSEABLE RULE FAILS THE WHOLE LISTING. Loki does not drop one bad rule and serve the rest:
+# the rules API answers HTTP 400 with a body that names the file, the group, the record and the
+# column, while the log STILL says "ruler up and running". So the boot step decides on the STATUS
+# CODE, and never polls with `curl -f`: `-f` discards a 400 and its body, and turns a precise
+# two-second failure into a timeout.
+#
+# X-Scope-OrgID IS MANDATORY on that API call. Loki runs auth_enabled: true (tenant `demo`).
+# Without the header the request resolves to a different tenant and returns an empty rule set.
+#
+# POSITIVE CONTROLS. Every validator in this repository is paired with a control that proves it
+# REJECTS a broken input, and this one is no exception. The last two steps run the same boot
+# check against (1) a copy of the real rules with one invalid LogQL expression added, and (2) the
+# real rules moved to a flat layout. Each must FAIL. A check that has never been seen to fail is
+# worse than none, because it reads as coverage.
+
+name: loki-rules-check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "config/loki/rules/**"
+      - "config/loki-config.yaml"
+      - ".github/workflows/loki-rules-check.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "config/loki/rules/**"
+      - "config/loki-config.yaml"
+
+permissions:
+  contents: read
+
+env:
+  # MUST track docker-compose.yml's loki image. Validating a different version than the stack
+  # runs is how a rule passes CI and fails at load.
+  LOKI_IMAGE: grafana/loki:3.7.3
+  # MUST match auth_enabled's tenant and the rules subdirectory name.
+  TENANT: demo
+
+jobs:
+  check-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: write the boot-and-assert helper
+        # One helper, used by the real check AND both positive controls, so a control cannot pass
+        # because it exercised a different code path from the check it guards.
+        #
+        # Usage: loki-rules-assert.sh <rules-dir> <expected-groups> <expected-rules>
+        # Exit 0 only when the API answers 200 with exactly the expected counts.
+        run: |
+          cat > /tmp/loki-rules-assert.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          rules_dir=$1 exp_g=$2 exp_r=$3
+          name=loki-ci-$$
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+
+          # The real config, unmodified: the mirror's Loki stores on the filesystem, so it boots
+          # on a runner as-is. The ruler's remote_write target (mimir:9009) does not resolve
+          # here; that only affects sends, never rule loading.
+          docker run -d --name "$name" -p 3100:3100 \
+            -v "$PWD/config/loki-config.yaml:/etc/loki/config.yaml:ro" \
+            -v "$rules_dir:/etc/loki/rules:ro" \
+            "$LOKI_IMAGE" -config.file=/etc/loki/config.yaml >/dev/null
+
+          # Capture code and body separately and decide on the code:
+          #   000 -> not listening yet; keep waiting
+          #   400 -> a rule failed to parse, or the rules dir is unreadable; fail now
+          #   200 -> assert the counts
+          # `curl -w '%{http_code}'` prints 000 AND exits non-zero when it cannot connect, so
+          # `|| echo 000` would yield "000000". Assign the fallback instead.
+          : > /tmp/rules.yaml
+          code=000
+          for _ in $(seq 1 60); do
+            code=$(curl -s -o /tmp/rules.yaml -w '%{http_code}' \
+                     -H "X-Scope-OrgID: $TENANT" localhost:3100/loki/api/v1/rules) || code=000
+            [ "$code" != "000" ] && break
+            sleep 2
+          done
+
+          echo "--- /loki/api/v1/rules (tenant $TENANT) -> HTTP $code ---"
+          cat /tmp/rules.yaml || true
+          echo
+          if [ "$code" = "000" ]; then
+            echo "Loki never answered /loki/api/v1/rules within 120s"
+            docker logs "$name" 2>&1 | tail -n 50 || true
+            exit 1
+          fi
+          if [ "$code" != "200" ]; then
+            echo "the rules API returned HTTP $code: $(tr '\n' ' ' < /tmp/rules.yaml)"
+            exit 1
+          fi
+
+          EXP_G=$exp_g EXP_R=$exp_r python3 - <<'PY'
+          import os, sys, yaml
+          try:
+              doc = yaml.safe_load(open("/tmp/rules.yaml"))
+          except Exception as e:
+              print(f"the rules API response is not YAML ({e})")
+              sys.exit(1)
+          # An unreadable rules dir returns a PLAIN-TEXT body, which safe_load turns into a str.
+          if not isinstance(doc, dict) or not doc:
+              print(f"the ruler loaded NO rules. Response was: {doc!r}")
+              sys.exit(1)
+          groups = [g for ns in doc.values() for g in (ns or [])]
+          rules = [r for g in groups for r in (g.get("rules") or [])]
+          got, exp = (len(groups), len(rules)), (int(os.environ["EXP_G"]), int(os.environ["EXP_R"]))
+          print(f"ruler loaded {got[1]} rules across {got[0]} groups; expected {exp[1]}/{exp[0]}")
+          # EQUALITY, not ">= 1". A skipped file (a .yml extension Loki does not scan, a
+          # permissions problem on the read-only mount) raises no error anywhere.
+          if got != exp:
+              print("rule count mismatch: something skipped a file or a group")
+              sys.exit(1)
+          PY
+          SH
+          chmod +x /tmp/loki-rules-assert.sh
+
+      - name: assert every file parses as a Loki rule-groups doc
+        # Runs BEFORE Loki starts, so a wrong-shaped file gets a precise error naming the file and
+        # the key. It also asserts the directory layout, which Loki will not complain about.
+        run: |
+          python3 - <<'PY'
+          import glob, os, sys, yaml
+
+          TENANT = os.environ["TENANT"]
+          bad = []
+
+          for path in sorted(glob.glob("config/loki/rules/*.y*ml")):
+              bad.append(
+                  f"{path}: rule files must live under config/loki/rules/{TENANT}/, not the rules "
+                  f"root. Loki reads <directory>/<tenant>/ and IGNORES the root silently."
+              )
+          for path in sorted(glob.glob(f"config/loki/rules/{TENANT}/*.yml")):
+              bad.append(f"{path}: use the .yaml extension, the one every other rule file uses")
+
+          files = sorted(glob.glob(f"config/loki/rules/{TENANT}/*.yaml"))
+          if not files:
+              print(f"::error::no rule files under config/loki/rules/{TENANT}/ - the ruler would load nothing")
+              sys.exit(1)
+
+          total_groups = total_rules = 0
+          for path in files:
+              doc = yaml.safe_load(open(path))
+              if not isinstance(doc, dict) or "groups" not in doc:
+                  bad.append(f"{path}: missing top-level 'groups:' key")
+                  continue
+              groups = doc["groups"]
+              if not isinstance(groups, list) or not groups:
+                  bad.append(f"{path}: 'groups' must be a non-empty list")
+                  continue
+              for g in groups:
+                  if not g.get("name"):
+                      bad.append(f"{path}: a group is missing 'name'")
+                  rules = g.get("rules") or []
+                  if not rules:
+                      bad.append(f"{path}: group {g.get('name')!r} has no rules")
+                  for r in rules:
+                      if not (r.get("alert") or r.get("record")):
+                          bad.append(f"{path}: group {g.get('name')!r} has a rule with neither 'alert' nor 'record'")
+                      if r.get("alert"):
+                          # Loki's alertmanager_url is deliberately empty, so a Loki alert never fires.
+                          bad.append(
+                              f"{path}: group {g.get('name')!r} defines an ALERT ({r['alert']!r}). "
+                              f"It would never fire. Alerts belong in config/mimir/rules/demo/."
+                          )
+                      if not r.get("expr"):
+                          bad.append(f"{path}: rule {r.get('record') or r.get('alert')!r} has no 'expr'")
+                  total_groups += 1
+                  total_rules += len(rules)
+
+          if bad:
+              for b in bad:
+                  print(f"::error::{b}")
+              sys.exit(1)
+          print(f"OK: {total_rules} rules across {total_groups} groups in {len(files)} file(s)")
+          # Handed to the next steps so they assert a NUMBER, not merely "something loaded".
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write(f"EXPECTED_RULES={total_rules}\nEXPECTED_GROUPS={total_groups}\n")
+          PY
+
+      - name: loki -verify-config
+        # The config carries the ruler's storage directory, remote_write block and WAL dir. A
+        # broken config stops LOG INGEST, not just rule loading. config-check.yml runs this too;
+        # it is repeated because a rules change is meaningless if the config will not load.
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/config/loki-config.yaml:/etc/loki/config.yaml:ro" \
+            "$LOKI_IMAGE" -config.file=/etc/loki/config.yaml -verify-config
+
+      - name: boot Loki and assert the ruler loaded every rule
+        run: |
+          set -euo pipefail
+          /tmp/loki-rules-assert.sh "$PWD/config/loki/rules" "$EXPECTED_GROUPS" "$EXPECTED_RULES"
+          echo "OK: the ruler loaded every rule"
+
+      - name: positive control - an invalid LogQL rule must fail the boot check
+        # The shape step above passes this file by design: it is not a LogQL parser. Only Loki
+        # can reject it, and it must, with HTTP 400 on the rules API.
+        run: |
+          set -euo pipefail
+          ctl=$(mktemp -d)
+          cp -r config/loki/rules/. "$ctl/"
+          {
+            echo 'groups:'
+            echo '  - name: positive-control'
+            echo '    rules:'
+            echo '      - record: stack:positive_control:5m'
+            echo '        expr: sum(count_over_time({service_name=~".+"} | unwrap [5m]))'
+          } > "$ctl/$TENANT/zz-positive-control.yaml"
+          chmod -R a+rX "$ctl"
+          if /tmp/loki-rules-assert.sh "$ctl" "$((EXPECTED_GROUPS + 1))" "$((EXPECTED_RULES + 1))"; then
+            echo "::error::the boot check accepted an unparseable LogQL rule - it is not checking anything"
+            exit 1
+          fi
+          echo "OK: the boot check rejects invalid LogQL"
+
+      - name: positive control - a flat rules layout must fail the boot check
+        # Loki boots fine with the rules in the root of the mount and loads nothing. The boot
+        # check must see that.
+        run: |
+          set -euo pipefail
+          ctl=$(mktemp -d)
+          cp config/loki/rules/"$TENANT"/*.yaml "$ctl/"
+          chmod -R a+rX "$ctl"
+          if /tmp/loki-rules-assert.sh "$ctl" "$EXPECTED_GROUPS" "$EXPECTED_RULES"; then
+            echo "::error::the boot check accepted a flat rules layout that Loki ignores"
+            exit 1
+          fi
+          echo "OK: the boot check rejects a flat layout"
