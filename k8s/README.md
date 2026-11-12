@@ -133,7 +133,7 @@ Where this chart sits:
   the pod's own identity and mounts the password as a **file**. No Kubernetes Secret is
   created, so nothing enters etcd. It is the same secret path `user_data.tpl` reads at boot,
   so one rotation reaches both planes.
-- **MinIO and Grafana on kind — tier 2, correctly.** A throwaway cluster.
+- **The object store and Grafana on kind — tier 2, correctly.** A throwaway cluster.
   `k8s/scripts/create-secrets.sh` **generates** the values; nothing is written down.
 
 Grafana reads a **file** in both planes, through the `__FILE` suffix that every `GF_`

@@ -47,7 +47,7 @@ collector:
     GOMEMLIMIT: 1500MiB
     GOGC: "400"
 
-minio:
+objectStore:
   persistence:
     size: 5Gi
 

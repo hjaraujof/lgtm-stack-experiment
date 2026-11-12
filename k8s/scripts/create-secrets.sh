@@ -29,22 +29,26 @@ gen() {
 kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 \
     || kubectl create namespace "$NAMESPACE"
 
-# --- MinIO root credentials -------------------------------------------------------------
+# --- Object store root credentials --------------------------------------------------------
 # Tempo and Mimir receive the SAME pair as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. That
 # is a local shortcut and not a pattern to copy: on AWS each backend has an identity, not a
 # key, and root credentials are never handed to a client.
-if kubectl -n "$NAMESPACE" get secret minio-credentials >/dev/null 2>&1; then
-    echo "minio-credentials already exists; leaving it alone"
+#
+# lgtm-s3-credentials is APPLIED, not created: it is a copy of the root pair, so a new root
+# pair must overwrite it. A cluster from before the object-store rename has an old copy.
+if kubectl -n "$NAMESPACE" get secret object-store-credentials >/dev/null 2>&1; then
+    echo "object-store-credentials already exists; leaving it alone"
 else
-    MINIO_USER="lgtm$(gen | cut -c1-8)"
-    MINIO_PASS="$(gen)"
-    kubectl -n "$NAMESPACE" create secret generic minio-credentials \
-        --from-literal=rootUser="$MINIO_USER" \
-        --from-literal=rootPassword="$MINIO_PASS"
+    S3_ROOT_USER="lgtm$(gen | cut -c1-8)"
+    S3_ROOT_PASS="$(gen)"
+    kubectl -n "$NAMESPACE" create secret generic object-store-credentials \
+        --from-literal=rootUser="$S3_ROOT_USER" \
+        --from-literal=rootPassword="$S3_ROOT_PASS"
     kubectl -n "$NAMESPACE" create secret generic lgtm-s3-credentials \
-        --from-literal=accessKeyId="$MINIO_USER" \
-        --from-literal=secretAccessKey="$MINIO_PASS"
-    echo "created minio-credentials and lgtm-s3-credentials"
+        --from-literal=accessKeyId="$S3_ROOT_USER" \
+        --from-literal=secretAccessKey="$S3_ROOT_PASS" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    echo "created object-store-credentials and wrote lgtm-s3-credentials to match"
 fi
 
 # --- Grafana credentials ----------------------------------------------------------------

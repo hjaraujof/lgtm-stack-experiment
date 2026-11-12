@@ -1,0 +1,203 @@
+{{- if .Values.objectStore.enabled }}
+{{/*
+The object store: an S3 server inside the cluster, for kind only.
+
+WHY THIS EXISTS RATHER THAN A FILESYSTEM BACKEND. config/tempo-config.yaml and
+config/mimir-config.yaml already say `backend: s3`. Switching them to a local directory for
+the cluster would mean the S3 code path - credentials, bucket lookup, retries, compaction
+uploads - is never exercised until it runs on AWS for the first time. An in-cluster S3 server
+keeps that path live locally and reduces the AWS change to three values: endpoint, bucket,
+and two flags.
+
+WHY VERSITY S3 GATEWAY AND NOT MINIO. This used to be MinIO. quay.io/minio/minio,
+quay.io/minio/mc and minio/minio on Docker Hub all stopped serving anonymous pulls: the
+registry answers 401 to a request for the pinned manifest. A chart whose default image cannot
+be pulled does not install, so the kind plane broke with nothing in this repository changed.
+Versity's gateway is Apache-2.0, publishes to Docker Hub, and reads its root key from two
+environment variables, so the existing Secret maps onto it with no config file to render.
+
+WHY --sidecar. The posix backend keeps object metadata (ETag, content type) in extended
+attributes by default. Whether a volume supports user xattrs depends on the node and the
+storage class, and kind's local-path volumes sit on whatever the host gives the node
+container. --sidecar keeps the metadata in a plain directory, so the server does not depend on
+the filesystem under it.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: object-store
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "object-store") | nindent 4 }}
+spec:
+  ports:
+    - name: api
+      port: 9000
+      targetPort: api
+  selector:
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "object-store") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: object-store
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+    {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "object-store") | nindent 4 }}
+spec:
+  serviceName: object-store
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "object-store") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lgtm.labels" . | nindent 8 }}
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "object-store") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        # The image declares no user, so without runAsUser it runs as root.
+        runAsNonRoot: true
+        # fsGroup CHOWNS THE MOUNTED VOLUME, so UID 1000 can create the two directories
+        # below. This one line replaces the `init` busybox services in docker-compose.yml,
+        # which exist only because a fresh Docker named volume is root-owned.
+        fsGroup: 1000
+      containers:
+        - name: versitygw
+          image: {{ .Values.images.objectStore }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          # A fresh volume has neither directory. The image ships /bin/sh, so create both and
+          # exec, which keeps the gateway as PID 1 so that it receives SIGTERM directly.
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              mkdir -p /data/buckets /data/meta &&
+              exec versitygw --port :9000 --health /health --quiet
+              posix --sidecar /data/meta /data/buckets
+          env:
+            - name: ROOT_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.objectStore.credentialsSecret }}, key: rootUser }
+            - name: ROOT_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.objectStore.credentialsSecret }}, key: rootPassword }
+          ports:
+            - name: api
+              containerPort: 9000
+          # --health above serves this path, unsigned, with HTTP 200.
+          readinessProbe:
+            httpGet: { path: /health, port: api }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.objectStore.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.objectStore.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.objectStore.persistence.size }}
+---
+{{/*
+Bucket creation.
+
+NOT A HELM HOOK, AND THE REASON IS A DEADLOCK THAT WAS REAL. This started as a
+post-install hook, which reads well and cannot work:
+
+  `helm install --wait` waits for every workload to become READY, and only THEN runs
+  the post-install hooks. Tempo cannot become ready without its bucket. So the install
+  waited ten minutes for a Tempo that was crash-looping on
+  `unexpected error from ListObjects on lgtm-traces: The specified bucket does not
+  exist`, timed out, and the hook that would have created the bucket never ran at all.
+
+A pre-install hook fails the other way: it would run before the object store exists.
+
+So this is an ordinary Job in the main phase. It starts alongside the object store, and the
+retry loop below covers the gap until the server answers. Tempo and Mimir crash-loop for a
+minute meanwhile, which looks alarming and is correct Kubernetes behaviour - a pod that
+cannot reach a dependency restarts until it can.
+
+NO S3 CLIENT IMAGE. curl signs the request itself with --aws-sigv4 (curl 7.75 and later), so
+the Job runs on the chart's own init-tools image and depends on no other registry. A
+CreateBucket on an existing bucket answers 409, and that counts as success here: every
+revision after the first finds its buckets already made. Any other status fails the Job, so a
+wrong key cannot pass as "created".
+
+THE NAME CARRIES THE REVISION because a Job's pod template is immutable. A fixed name
+makes the second `helm upgrade` fail with `field is immutable`. One Job per revision
+avoids that, at the cost of leaving completed Jobs behind; ttlSecondsAfterFinished
+clears them.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: object-store-make-buckets-{{ .Release.Revision }}
+  labels:
+    {{- include "lgtm.labels" . | nindent 4 }}
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "lgtm.selectorLabels" (dict "ctx" $ "component" "object-store-make-buckets") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: make-buckets
+          image: {{ .Values.images.initTools }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.objectStore.credentialsSecret }}, key: rootUser }
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.objectStore.credentialsSecret }}, key: rootPassword }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              endpoint=http://object-store:9000
+              for i in $(seq 1 60); do
+                if curl -sf -o /dev/null "$endpoint/health"; then
+                  break
+                fi
+                if [ "$i" -eq 60 ]; then
+                  echo "object store never became healthy at $endpoint" >&2
+                  exit 1
+                fi
+                echo "object store not ready yet (attempt $i); retrying in 5s"
+                sleep 5
+              done
+              make_bucket() {
+                local code
+                code=$(curl -s -o /tmp/resp -w '%{http_code}' \
+                  --aws-sigv4 "aws:amz:us-east-1:s3" --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" \
+                  -X PUT "$endpoint/$1")
+                case "$code" in
+                  200) echo "created $1" ;;
+                  409) echo "exists  $1" ;;
+                  *)   echo "CreateBucket $1 answered HTTP $code:" >&2; cat /tmp/resp >&2; exit 1 ;;
+                esac
+              }
+              {{- range .Values.objectStore.buckets }}
+              make_bucket {{ . }}
+              {{- end }}
+{{- end }}

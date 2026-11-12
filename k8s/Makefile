@@ -87,19 +87,36 @@ verify-configs: check-sync ## Run each backend's own validator against the RENDE
 # Cluster
 # ---------------------------------------------------------------------------------------
 
+# --name IS REQUIRED. kind/kind-cluster.yaml sets `name: lgtm`, and without the flag that name
+# wins, so `CLUSTER=other make up` created a cluster called lgtm and then failed in `image`,
+# which loads into $(CLUSTER). The flag overrides the config file's name.
 .PHONY: cluster
 cluster: ## Create the kind cluster
-	kind create cluster --config "$(CURDIR)/kind/kind-cluster.yaml"
+	kind create cluster --name "$(CLUSTER)" --config "$(CURDIR)/kind/kind-cluster.yaml"
 
 .PHONY: image
 image: ## Build the init-tools image and load it into kind
 	docker build -t "$(INIT_IMAGE)" "$(CURDIR)/images/init-tools"
 	kind load docker-image "$(INIT_IMAGE)" --name "$(CLUSTER)"
 
+# AN AVAILABLE CONTROLLER IS NOT AN ANSWERING WEBHOOK. ingress-nginx registers a validating
+# admission webhook for every Ingress. The Deployment can report available while that
+# webhook's Service still refuses connections, and the chart's Ingress then fails the
+# install with `failed calling webhook "validate.nginx.ingress.kubernetes.io" ...
+# connection refused`. So after the wait, ask the webhook itself: a server-side dry run of
+# an Ingress passes through admission and creates nothing. Retry until it is accepted.
 .PHONY: addons
 addons: ## Install ingress-nginx and cert-manager
 	kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/kind/deploy.yaml
 	kubectl -n ingress-nginx wait --for=condition=available deploy/ingress-nginx-controller --timeout=300s
+	@for i in $$(seq 1 60); do \
+	    if kubectl -n default create ingress webhook-probe --class=nginx \
+	         --rule='probe.invalid/=probe:80' --dry-run=server -o name >/dev/null 2>&1; then \
+	      echo "OK: the ingress-nginx admission webhook answers"; break; \
+	    fi; \
+	    if [ "$$i" -eq 60 ]; then echo "ERROR: the ingress-nginx admission webhook never answered"; exit 1; fi; \
+	    sleep 5; \
+	  done
 	helm repo add jetstack https://charts.jetstack.io --force-update
 	helm upgrade --install cert-manager jetstack/cert-manager \
 	  -n cert-manager --create-namespace --set crds.enabled=true
