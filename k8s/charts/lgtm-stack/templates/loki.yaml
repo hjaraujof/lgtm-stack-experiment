@@ -5,9 +5,9 @@ A STATEFULSET, NOT A DEPLOYMENT. Loki holds its chunks, its TSDB index and its c
 working directory on disk under /tmp/loki. A Deployment's pods share one PersistentVolume
 claim or none; a StatefulSet gives each pod a stable name and its OWN volume, created from
 the template at the bottom of this file. That is the correct shape for anything that owns
-data, and it is the shape Loki, Tempo, Mimir, Grafana and MinIO all take here.
+data, and it is the shape Loki, Tempo, Mimir, Grafana and the object store all take here.
 
-LOKI STAYS ON THE FILESYSTEM BACKEND. Tempo and Mimir point at MinIO; Loki does not. The
+LOKI STAYS ON THE FILESYSTEM BACKEND. Tempo and Mimir point at the object store; Loki does not. The
 reason is in config/loki-config.yaml: Loki does not migrate existing data across a store
 change, and the supported move ADDS a schema period with a future `from:` date. That is a
 dated deploy step, not a chart value, so it is out of scope here and stated rather than

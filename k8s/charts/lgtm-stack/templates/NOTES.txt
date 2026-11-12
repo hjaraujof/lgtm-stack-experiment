@@ -24,11 +24,11 @@ Read it back with:
   kubectl -n {{ .Release.Namespace }} get secret {{ .Values.grafana.credentialsSecret }} \
     -o jsonpath='{.data.admin-password}' | base64 -d
 {{- end }}
-{{- if .Values.minio.enabled }}
+{{- if .Values.objectStore.enabled }}
 
-MinIO holds the local object storage. Its root credentials are a generated Kubernetes
+The in-cluster object store (Versity S3 Gateway) holds the local object storage. Its root credentials are a generated Kubernetes
 Secret, which is base64 and NOT encryption. That is acceptable for a throwaway cluster and
-is not acceptable anywhere else: values-eks.yaml turns MinIO off and gives Tempo and Mimir
+is not acceptable anywhere else: values-eks.yaml turns it off and gives Tempo and Mimir
 an AWS identity instead of a key.
 {{- end }}
 {{- if and .Values.ingress.enabled .Values.ingress.tls.enabled (eq .Values.ingress.tls.clusterIssuer "selfsigned") }}

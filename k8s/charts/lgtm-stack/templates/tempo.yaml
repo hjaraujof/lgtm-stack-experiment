@@ -1,7 +1,7 @@
 {{/*
 Tempo.
 
-Trace BLOCKS go to object storage (MinIO here, S3 on AWS). The local volume still matters
+Trace BLOCKS go to object storage (the in-cluster object store here, S3 on AWS). The local volume still matters
 and is not a leftover: the write-ahead log, the block scratch directory and the metrics
 generator's own WAL all stay on disk. Losing that volume loses whatever has not flushed.
 

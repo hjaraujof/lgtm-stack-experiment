@@ -8,9 +8,9 @@
 # and issuer before installing anything. The repository is org-agnostic on purpose.
 
 # ==========================================================================================
-# NO MINIO, AND NO KEY ANYWHERE
+# NO IN-CLUSTER OBJECT STORE, AND NO KEY ANYWHERE
 # ==========================================================================================
-minio:
+objectStore:
   enabled: false
 
 s3Credentials:

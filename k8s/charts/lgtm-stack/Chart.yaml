@@ -14,6 +14,6 @@ version: 0.1.0
 # same config is the drift this repository exists to avoid.
 appVersion: "1.0.0"
 
-# NO DEPENDENCIES ON PURPOSE. MinIO, Loki, Tempo, Mimir and Grafana all have upstream
+# NO DEPENDENCIES ON PURPOSE. The object store, Loki, Tempo, Mimir and Grafana all have upstream
 # charts, and using them would be the production choice. This chart writes every object
 # by hand instead, because the object is the thing being learned. See k8s/README.md.
